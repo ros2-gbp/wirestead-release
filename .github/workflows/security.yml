@@ -1,0 +1,126 @@
+name: Security
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  # Trivy Security Scan
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install dependencies
+      uses: ./.github/actions/apt-install
+      with:
+        packages: "build-essential cmake"
+
+    - name: Install dependencies with vcpkg
+      uses: ./.github/actions/setup-vcpkg
+      with:
+        triplet: x64-linux
+
+    - name: Build project
+      run: |
+        cmake -S . -B build-deps \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_STANDARD=20 \
+          -DWIRESTEAD_ENABLE_CONFIG=ON \
+          -DWIRESTEAD_BUILD_DOCS=OFF \
+          -DWIRESTEAD_BUILD_TESTS=OFF \
+          -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+          -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+        cmake --build build-deps -j $(nproc)
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@v0.36.0
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        skip-dirs: 'build,build-deps,vcpkg,.git'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v4
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Dependency Security Check
+  dependency-check:
+    name: Dependency Security Check
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install dependencies
+      uses: ./.github/actions/apt-install
+      with:
+        packages: "build-essential cmake"
+
+    - name: Install dependencies with vcpkg
+      uses: ./.github/actions/setup-vcpkg
+      with:
+        triplet: x64-linux
+
+    - name: Build project
+      run: |
+        cmake -S . -B build-deps \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_STANDARD=20 \
+          -DWIRESTEAD_ENABLE_CONFIG=ON \
+          -DWIRESTEAD_BUILD_DOCS=OFF \
+          -DWIRESTEAD_BUILD_TESTS=OFF \
+          -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+          -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+        cmake --build build-deps -j $(nproc)
+
+    - name: Check for known vulnerabilities in dependencies
+      run: |
+        echo "Checking system packages for vulnerabilities..."
+        apt list --upgradable 2>/dev/null | grep -E "(security|vulnerability)" || echo "No known vulnerabilities found in system packages"
+        
+        echo "Checking vcpkg dependency versions..."
+        "${VCPKG_ROOT}/vcpkg" list
+
+  # Security Summary
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-24.04
+    needs: [trivy-scan, dependency-check]
+    if: always()
+
+    steps:
+    - name: Security Summary
+      run: |
+        echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Trivy File System Scan | ${{ needs.trivy-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependency Check | ${{ needs.dependency-check.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY

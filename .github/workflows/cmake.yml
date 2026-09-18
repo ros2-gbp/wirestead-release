@@ -1,0 +1,173 @@
+name: CMake
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Matrix for Pure C++ (existing configuration)
+          - name: C++ (Linux, GCC)
+            os: ubuntu-24.04
+            triplet: x64-linux
+            cc: gcc
+            cxx: g++
+            generator: Ninja
+            build_type: Release
+          - name: C++ (Linux ARM64, GCC, Ubuntu 24.04)
+            os: ubuntu-24.04-arm
+            triplet: arm64-linux
+            cc: gcc
+            cxx: g++
+            generator: Ninja
+            build_type: Release
+          - name: C++ (Linux, GCC, Ubuntu 22.04)
+            os: ubuntu-22.04
+            triplet: x64-linux
+            cc: gcc
+            cxx: g++
+            generator: Ninja
+            build_type: Release
+          - name: C++ (Windows, MSVC)
+            os: windows-2022
+            triplet: x64-windows-static-md
+            cc: cl
+            cxx: cl
+            generator: "Visual Studio 17 2022"
+            build_type: Release
+          - name: C++ (macOS, Clang)
+            os: macos-15
+            triplet: arm64-osx
+            cc: /opt/homebrew/opt/llvm/bin/clang
+            cxx: /opt/homebrew/opt/llvm/bin/clang++
+            generator: Ninja
+            build_type: Release
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_TARGET_TRIPLET: ${{ matrix.triplet }}
+      BUILD_TYPE: ${{ matrix.build_type }}
+      VCPKG_USE_SYSTEM_BINARIES: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Build Dependencies (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ca-certificates
+            
+            # Install build tools (default GCC is pre-installed; install explicit compilers only when needed)
+            EXTRA_PKGS=""
+            if [[ "${{ matrix.cc }}" == "clang"* ]]; then
+              EXTRA_PKGS="${{ matrix.cc }} ${{ matrix.cxx }}"
+            fi
+            sudo apt-get install -y ninja-build autoconf autoconf-archive automake libtool libtool-bin pkg-config $EXTRA_PKGS
+          else
+            brew install ninja autoconf autoconf-archive automake libtool pkg-config llvm
+          fi
+
+      # Windows resolves x64-windows-static-md from the checked-in overlay; the
+      # other triplets come from vcpkg's own set and ignore it.
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        env:
+          CC: ${{ runner.os != 'Windows' && matrix.cc || '' }}
+          CXX: ${{ runner.os != 'Windows' && matrix.cxx || '' }}
+        with:
+          triplet: ${{ matrix.triplet }}
+          packages: boost-asio boost-system spdlog
+          overlay-triplets: .github/vcpkg-triplets
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build \
+            -G "${{ matrix.generator }}" \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
+            -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE}" \
+            -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}"
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          echo "macOS SDK version: $SDK_VER"
+          export MACOSX_DEPLOYMENT_TARGET="$SDK_VER"
+
+          cmake -S . -B build \
+            -G "${{ matrix.generator }}" \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DCMAKE_C_COMPILER="${{ matrix.cc }}" \
+            -DCMAKE_CXX_COMPILER="${{ matrix.cxx }}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$SDK_VER" \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE}" \
+            -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "${{ matrix.generator }}" -A x64 `
+            -DCMAKE_BUILD_TYPE="${env:BUILD_TYPE}" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
+            -DWIRESTEAD_BUILD_DOCS=OFF `
+            -DWIRESTEAD_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config "${BUILD_TYPE}" --parallel
+
+      - name: Build unit tests
+        if: runner.os == 'Windows'
+        run: cmake --build build --target wirestead_unit_tests --config "${BUILD_TYPE}"
+
+      - name: Test (Windows, Full C++)
+        if: runner.os == 'Windows'
+        working-directory: build
+        shell: pwsh
+        run: |
+          ctest -C "${env:BUILD_TYPE}" --output-on-failure
+          if ($LASTEXITCODE -ne 0) {
+            ctest -C "${env:BUILD_TYPE}" --rerun-failed --output-on-failure
+          }
+
+      - name: Test (Linux/macOS, Full C++)
+        if: runner.os != 'Windows'
+        working-directory: build
+        run: |
+          ctest --output-on-failure --parallel 2 || \
+          ctest --rerun-failed --output-on-failure --parallel 2

@@ -1,0 +1,275 @@
+name: Vcpkg Package Test
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches-ignore:
+      - "**"
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+jobs:
+  vcpkg-overlay:
+    name: vcpkg (${{ matrix.os }} - ${{ matrix.triplet }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triplet: x64-linux
+          - os: ubuntu-24.04
+            triplet: x64-linux-dynamic
+          - os: windows-2022
+            triplet: x64-windows
+          - os: windows-2022
+            triplet: x64-windows-static
+          - os: macos-15
+            triplet: arm64-osx
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Cache vcpkg
+        id: cache-vcpkg
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('VCPKG_BASELINE', '**/vcpkg.json') }}
+
+      - name: Clone vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sha="$(cat VCPKG_BASELINE)"
+          git init "${{ env.VCPKG_ROOT }}"
+          git -C "${{ env.VCPKG_ROOT }}" remote add origin https://github.com/microsoft/vcpkg.git
+          git -C "${{ env.VCPKG_ROOT }}" fetch --depth 1 origin "$sha"
+          git -C "${{ env.VCPKG_ROOT }}" checkout FETCH_HEAD
+
+      - name: Bootstrap vcpkg (Unix)
+        if: runner.os != 'Windows'
+        run: "${VCPKG_ROOT}/bootstrap-vcpkg.sh"
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${env:VCPKG_ROOT}\bootstrap-vcpkg.bat"
+
+      - name: Check wirestead port availability (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          if ! "${VCPKG_ROOT}/vcpkg" search wirestead | grep -q "^wirestead"; then
+            echo "wirestead port not found in the vcpkg registry."
+            exit 1
+          fi
+
+      - name: Check wirestead port availability (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $searchOutput = & "${env:VCPKG_ROOT}\vcpkg.exe" search wirestead
+          if (-not ($searchOutput -match "^wirestead")) {
+            Write-Error "wirestead port not found in the vcpkg registry."
+            exit 1
+          }
+
+      - name: Install wirestead via vcpkg (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          "${VCPKG_ROOT}/vcpkg" install "wirestead:${{ matrix.triplet }}" \
+            --clean-after-build
+
+      - name: Install wirestead via vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${env:VCPKG_ROOT}\vcpkg.exe" install "wirestead:${{ matrix.triplet }}" `
+            --clean-after-build
+
+      - name: Verify installation layout (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          INSTALL_ROOT="${VCPKG_ROOT}/installed/${{ matrix.triplet }}"
+
+          echo "Checking headers..."
+          test -d "${INSTALL_ROOT}/include/wirestead"
+          test -d "${INSTALL_ROOT}/include/unilink"
+
+          echo "Checking CMake package config..."
+          test -f "${INSTALL_ROOT}/share/wirestead/wiresteadConfig.cmake"
+          test -f "${INSTALL_ROOT}/share/unilink/unilinkConfig.cmake"
+
+          echo "Checking pkg-config file..."
+          test -f "${INSTALL_ROOT}/lib/pkgconfig/wirestead.pc"
+          test -f "${INSTALL_ROOT}/lib/pkgconfig/unilink.pc"
+
+          echo "Checking libraries (release + debug)..."
+          LIB_FILES=$(find "${INSTALL_ROOT}" -type f \
+            \( -path "*/lib/*" -o -path "*/lib64/*" -o -path "*/debug/lib/*" -o -path "*/bin/*" \) \
+            \( -name "libwirestead*.a" -o -name "libwirestead*.so*" -o -name "libwirestead*.dylib" -o -name "wirestead*.dll" -o -name "wirestead*.lib" \) \
+            | sort || true)
+          if [ -z "${LIB_FILES}" ]; then
+            echo "No wirestead libraries found in ${INSTALL_ROOT}"
+            echo "Listing tree for debugging:"
+            find "${INSTALL_ROOT}" -maxdepth 3 -type d -print
+            exit 1
+          fi
+          echo "${LIB_FILES}"
+
+          if find "${INSTALL_ROOT}" -type f \
+            \( -path "*/lib/*" -o -path "*/lib64/*" -o -path "*/debug/lib/*" -o -path "*/bin/*" \) \
+            \( -name "libunilink*.a" -o -name "libunilink*.so*" -o -name "libunilink*.dylib" -o -name "unilink*.dll" -o -name "unilink*.lib" \) \
+            | grep -q .; then
+            echo "Unexpected legacy libunilink binary compatibility artifact found"
+            exit 1
+          fi
+
+      - name: Verify installation layout (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installRoot = "$env:VCPKG_ROOT\installed\${{ matrix.triplet }}"
+
+          Write-Host "Checking headers..."
+          if (-not (Test-Path "$installRoot\include\wirestead")) { throw "Wirestead headers not found" }
+          if (-not (Test-Path "$installRoot\include\unilink")) { throw "Legacy headers not found" }
+
+          Write-Host "Checking CMake package config..."
+          if (-not (Test-Path "$installRoot\share\wirestead\wiresteadConfig.cmake")) { throw "wiresteadConfig.cmake not found" }
+          if (-not (Test-Path "$installRoot\share\unilink\unilinkConfig.cmake")) { throw "unilinkConfig.cmake not found" }
+
+          Write-Host "Collecting libraries..."
+          $libs = @(Get-ChildItem -Path "$installRoot\lib" -Recurse -Include *wirestead*.lib -ErrorAction SilentlyContinue)
+          $dlls = @(Get-ChildItem -Path "$installRoot\bin" -Recurse -Include *wirestead*.dll -ErrorAction SilentlyContinue)
+          if ($libs.Count -eq 0 -and $dlls.Count -eq 0) {
+            throw "No wirestead libraries or DLLs found under $installRoot"
+          }
+          $legacyLibs = @(Get-ChildItem -Path "$installRoot\lib" -Recurse -Include *unilink*.lib -ErrorAction SilentlyContinue)
+          $legacyDlls = @(Get-ChildItem -Path "$installRoot\bin" -Recurse -Include *unilink*.dll -ErrorAction SilentlyContinue)
+          if ($legacyLibs.Count -ne 0 -or $legacyDlls.Count -ne 0) {
+            throw "Unexpected legacy libunilink binary compatibility artifact found under $installRoot"
+          }
+          $libs + $dlls | ForEach-Object { Write-Host "  $_" }
+
+      - name: Build and run consumer sample (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          WORKDIR=$(mktemp -d)
+
+          cat > "${WORKDIR}/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.15)
+          project(wirestead_consumer LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          find_package(wirestead CONFIG REQUIRED)
+
+          add_executable(vcpkg_consumer main.cpp)
+          if(NOT TARGET wirestead::wirestead)
+            message(FATAL_ERROR "Expected vcpkg package to provide wirestead::wirestead")
+          endif()
+          target_link_libraries(vcpkg_consumer PRIVATE wirestead::wirestead)
+          EOF
+
+          cat > "${WORKDIR}/main.cpp" <<'EOF'
+          #include <wirestead/wirestead.hpp>
+          #include <chrono>
+          #include <iostream>
+
+          int main() {
+            auto client = wirestead::tcp_client("127.0.0.1", 9000)
+                .retry_interval(std::chrono::milliseconds(250))
+                .max_retries(1)
+                .auto_start(false)
+                .build();
+            std::cout << "wirestead vcpkg package loaded" << std::endl;
+            return client ? 0 : 1;
+          }
+          EOF
+
+          cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
+            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build "${WORKDIR}/build" --config Release
+          "${WORKDIR}/build/vcpkg_consumer"
+
+      - name: Build and run consumer sample (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $workDir = Join-Path $env:RUNNER_TEMP "wirestead-consumer"
+          New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+
+          @"
+          cmake_minimum_required(VERSION 3.15)
+          project(wirestead_consumer LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 20)
+
+          # vcpkg's static triplets build wirestead and its dependencies
+          # (spdlog, fmt) against the static MSVC runtime. Without this, the
+          # consumer executable defaults to the dynamic runtime and link
+          # fails with LNK2038/LNK2005 runtime-library mismatches.
+          cmake_policy(SET CMP0091 NEW)
+          if(VCPKG_TARGET_TRIPLET MATCHES "-static`$")
+            set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded`$<`$<CONFIG:Debug>:Debug>")
+          endif()
+
+          find_package(wirestead CONFIG REQUIRED)
+
+          add_executable(vcpkg_consumer main.cpp)
+          if(NOT TARGET wirestead::wirestead)
+            message(FATAL_ERROR "Expected vcpkg package to provide wirestead::wirestead")
+          endif()
+          target_link_libraries(vcpkg_consumer PRIVATE wirestead::wirestead)
+          "@ | Set-Content -Path (Join-Path $workDir "CMakeLists.txt")
+
+          @"
+          #include <wirestead/wirestead.hpp>
+          #include <chrono>
+          #include <iostream>
+
+          int main() {
+            auto client = wirestead::tcp_client("127.0.0.1", 9000)
+                .retry_interval(std::chrono::milliseconds(250))
+                .max_retries(1)
+                .auto_start(false)
+                .build();
+            std::cout << "wirestead vcpkg package loaded" << std::endl;
+            return client ? 0 : 1;
+          }
+          "@ | Set-Content -Path (Join-Path $workDir "main.cpp")
+
+          cmake -S $workDir -B "$workDir/build" `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build "$workDir/build" --config Release
+
+          $exe = Join-Path "$workDir/build" "vcpkg_consumer.exe"
+          $alt = Join-Path "$workDir/build/Release" "vcpkg_consumer.exe"
+          if (Test-Path $exe) {
+            & $exe
+          } elseif (Test-Path $alt) {
+            & $alt
+          } else {
+            throw "Consumer executable not found"
+          }

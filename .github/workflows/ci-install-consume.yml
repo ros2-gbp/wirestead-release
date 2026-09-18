@@ -1,0 +1,251 @@
+name: CI - install & consume
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  build-test-install-consume:
+    name: install & consume (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            compiler: gcc
+            triplet: x64-linux
+          - os: ubuntu-24.04
+            compiler: clang
+            triplet: x64-linux
+          - os: macos-15
+            compiler: clang
+            triplet: arm64-osx
+          - os: windows-2022
+            compiler: msvc
+            triplet: x64-windows
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up C++ toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config
+
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            echo "CC=gcc" >> $GITHUB_ENV
+            echo "CXX=g++" >> $GITHUB_ENV
+          else
+            sudo apt-get install -y clang-18
+            echo "CC=clang-18" >> $GITHUB_ENV
+            echo "CXX=clang++-18" >> $GITHUB_ENV
+          fi
+
+      - name: Set up C++ toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja pkg-config
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      # Windows gets a short vcpkg root to keep the buildtrees clear of the
+      # Windows path limit; everywhere else the default workspace root is fine.
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+          vcpkg-root: ${{ runner.os == 'Windows' && 'C:/vcpkg-pinned' || '' }}
+
+      - name: Configure
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/wirestead-install" \
+            -DWIRESTEAD_ENABLE_INSTALL=ON \
+            -DWIRESTEAD_ENABLE_PKGCONFIG=ON \
+            -DWIRESTEAD_ENABLE_EXPORT_HEADER=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+
+      # Visual Studio is a multi-config generator, so the configuration is
+      # chosen at build and install time rather than at configure time.
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/wirestead-install" \
+            -DWIRESTEAD_ENABLE_INSTALL=ON \
+            -DWIRESTEAD_ENABLE_EXPORT_HEADER=ON \
+            -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE" \
+            -DVCPKG_TARGET_TRIPLET="$VCPKG_TARGET_TRIPLET"
+
+      - name: Build
+        if: runner.os != 'Windows'
+        run: cmake --build build --config Release -- -v
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cmake --build build --config Release
+
+      - name: Install
+        if: runner.os != 'Windows'
+        run: cmake --install build --prefix "$RUNNER_TEMP/wirestead-install"
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cmake --install build --config Release --prefix "$RUNNER_TEMP/wirestead-install"
+
+      # Guards the export restriction in cmake/wirestead.map and wirestead.exp.
+      # A wrong symbol pattern does not fail the link, it just exports nothing
+      # or everything, and the unit tests cannot notice because they link the
+      # static library. This is the only place that inspects the shared one.
+      # Skipped on Windows on purpose: DLL exports are opt-in through
+      # __declspec(dllexport), so a DLL cannot re-export what it links
+      # against, and there is no version script or symbols list to get wrong.
+      - name: Verify shared library exports
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib_dir="$RUNNER_TEMP/wirestead-install/lib"
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            lib="$(ls "$lib_dir"/libwirestead*.dylib | head -n 1)"
+            symbols="$(nm -gU "$lib")"
+          else
+            lib="$(ls "$lib_dir"/libwirestead.so.* | head -n 1)"
+            symbols="$(nm -D --defined-only "$lib")"
+          fi
+          echo "inspecting $lib"
+
+          owner() { printf '%s\n' "$symbols" | grep -cE "^[^ ]* [A-Za-z] _?_Z[A-Za-z]*$1" || true; }
+          ours="$(owner 9wirestead)"
+          foreign="$(( $(owner 5boost) + $(owner 6spdlog) + $(owner 3fmt) ))"
+          echo "wirestead symbols: $ours, third-party symbols: $foreign"
+
+          if [ "$ours" -eq 0 ]; then
+            echo "the shared library exports no wirestead symbols; the export list did not match"
+            exit 1
+          fi
+          if [ "$foreign" -ne 0 ]; then
+            echo "the shared library re-exports third-party symbols:"
+            offenders="$(printf '%s\n' "$symbols" | grep -E "^[^ ]* [A-Za-z] _?_Z[A-Za-z]*(5boost|6spdlog|3fmt)" || true)"
+            printf '%s\n' "$offenders" | head -20 || true
+            exit 1
+          fi
+
+      - name: Consume canonical package (find_package)
+        shell: bash
+        run: |
+          install_prefix="$RUNNER_TEMP/wirestead-install"
+          mkdir -p "$RUNNER_TEMP/consumer" && cd "$RUNNER_TEMP/consumer"
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.12)
+          project(consumer CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          find_package(wirestead CONFIG REQUIRED)
+          if(NOT TARGET wirestead::wirestead)
+            message(FATAL_ERROR "Expected installed package to provide wirestead::wirestead")
+          endif()
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE wirestead::wirestead)
+          EOF
+          cat > main.cpp <<'EOF'
+          #include <wirestead/wirestead.hpp>
+          #include <iostream>
+          int main(){
+            wirestead::diagnostics::Logger::instance().set_console_output(false);
+            wirestead::diagnostics::Logger::instance().set_level(wirestead::diagnostics::LogLevel::INFO);
+            std::cout << "wirestead package consumed successfully!\n";
+            return 0;
+          }
+          EOF
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            generator=(-G "Visual Studio 17 2022" -A x64)
+            binary="./build/Release/consumer.exe"
+            export PATH="$install_prefix/bin:/c/vcpkg-pinned/installed/$VCPKG_TARGET_TRIPLET/bin:$PATH"
+          else
+            generator=(-G Ninja)
+            binary="./build/consumer"
+          fi
+          cmake -S . -B build "${generator[@]}" \
+            -DCMAKE_PREFIX_PATH="$install_prefix" \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+          cmake --build build --config Release
+          "$binary"
+
+      - name: Consume legacy package (find_package)
+        shell: bash
+        run: |
+          install_prefix="$RUNNER_TEMP/wirestead-install"
+          mkdir -p "$RUNNER_TEMP/consumer-legacy" && cd "$RUNNER_TEMP/consumer-legacy"
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.12)
+          project(legacy_consumer CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          find_package(unilink CONFIG REQUIRED)
+          if(NOT TARGET unilink::unilink)
+            message(FATAL_ERROR "Expected installed package to provide unilink::unilink")
+          endif()
+          add_executable(legacy_consumer main.cpp)
+          target_link_libraries(legacy_consumer PRIVATE unilink::unilink)
+          EOF
+          cat > main.cpp <<'EOF'
+          #include <unilink/unilink.hpp>
+          #include <iostream>
+          int main(){
+            unilink::diagnostics::Logger::instance().set_console_output(false);
+            unilink::diagnostics::Logger::instance().set_level(unilink::diagnostics::LogLevel::INFO);
+            std::cout << "unilink compatibility package consumed successfully!\n";
+            return 0;
+          }
+          EOF
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            generator=(-G "Visual Studio 17 2022" -A x64)
+            binary="./build/Release/legacy_consumer.exe"
+            export PATH="$install_prefix/bin:/c/vcpkg-pinned/installed/$VCPKG_TARGET_TRIPLET/bin:$PATH"
+          else
+            generator=(-G Ninja)
+            binary="./build/legacy_consumer"
+          fi
+          cmake -S . -B build "${generator[@]}" \
+            -DCMAKE_PREFIX_PATH="$install_prefix" \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+          cmake --build build --config Release
+          "$binary"
+
+      # pkg-config is not part of the MSVC consumption story, and the Windows
+      # runners have no pkg-config to test with.
+      - name: Test pkg-config
+        if: runner.os != 'Windows'
+        run: |
+          # wirestead.pc and unilink.pc both need vcpkg's pkg-config modules
+          # when dependencies such as spdlog are external.
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/wirestead-install/lib/pkgconfig:$VCPKG_ROOT/installed/$VCPKG_TARGET_TRIPLET/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          echo "Testing pkg-config integration..."
+          pkg-config --cflags --libs wirestead
+          pkg-config --cflags --libs unilink
+          echo "pkg-config test completed successfully!"

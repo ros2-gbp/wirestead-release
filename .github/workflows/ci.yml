@@ -1,0 +1,564 @@
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+
+env:
+  CXX_STANDARD: 20
+
+jobs:
+  # ── COMPILE (Release, all Linux/macOS platforms) ─────────────────────────────
+  # Fast gate: validates Release compilation before tests run.
+  # Covers ubuntu-22.04-arm (not in any other workflow) and minimal config.
+  compile:
+    name: Compile (${{ matrix.os }}, ${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     label: gcc,           cc: gcc,        cxx: g++,        triplet: x64-linux,   enable_config: "ON"  }
+          - { os: ubuntu-22.04-arm, label: gcc,           cc: gcc,        cxx: g++,        triplet: arm64-linux,  enable_config: "ON"  }
+          - { os: ubuntu-24.04,     label: gcc,           cc: gcc,        cxx: g++,        triplet: x64-linux,   enable_config: "ON"  }
+          - { os: ubuntu-24.04,     label: gcc (minimal), cc: gcc,        cxx: g++,        triplet: x64-linux,   enable_config: "OFF" }
+          - { os: ubuntu-24.04,     label: clang,         cc: clang-18,   cxx: clang++-18, triplet: x64-linux,   enable_config: "ON"  }
+          - { os: ubuntu-24.04-arm, label: gcc,           cc: gcc,        cxx: g++,        triplet: arm64-linux,  enable_config: "ON"  }
+          - { os: macos-15,         label: clang,         cc: clang,      cxx: clang++,    triplet: arm64-osx,   enable_config: "ON"  }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+          if [ "${{ matrix.cc }}" = "clang-18" ]; then
+            sudo apt-get install -y clang-18
+          fi
+          echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+          echo "CXX=${{ matrix.cxx }}" >> $GITHUB_ENV
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$SDK_VER" \
+              -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+              -DWIRESTEAD_ENABLE_CONFIG=${{ matrix.enable_config }} \
+              -DWIRESTEAD_BUILD_TESTS=OFF \
+              -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE}" \
+              -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}"
+          else
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=$CC \
+              -DCMAKE_CXX_COMPILER=$CXX \
+              -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+              -DWIRESTEAD_ENABLE_CONFIG=${{ matrix.enable_config }} \
+              -DWIRESTEAD_BUILD_TESTS=OFF \
+              -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+              -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+          fi
+
+      - name: Build
+        run: cmake --build build --parallel
+
+  # ── UNIT TESTS (Debug, Linux + macOS) ────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    needs: [compile]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     compiler: gcc,   cc: gcc,      cxx: g++,        triplet: x64-linux   }
+          - { os: ubuntu-24.04,     compiler: clang, cc: clang-18, cxx: clang++-18, triplet: x64-linux   }
+          - { os: ubuntu-24.04-arm, compiler: gcc,   cc: gcc,      cxx: g++,        triplet: arm64-linux  }
+          - { os: ubuntu-22.04,     compiler: gcc,   cc: gcc,      cxx: g++,        triplet: x64-linux   }
+          - { os: macos-15,         compiler: clang, cc: /opt/homebrew/opt/llvm/bin/clang, cxx: /opt/homebrew/opt/llvm/bin/clang++, triplet: arm64-osx }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute CMakeLists hash
+        id: cmake-hash
+        run: |
+          FILES=$(git ls-files '**/CMakeLists.txt')
+          if [ -z "$FILES" ]; then
+            echo "hash=none" >> "$GITHUB_OUTPUT"
+          else
+            HASH=$(printf '%s\n' "$FILES" | LC_ALL=C sort | xargs shasum | shasum | awk '{print $1}')
+            echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.os }}-${{ matrix.compiler }}-${{ steps.cmake-hash.outputs.hash }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.os }}-${{ matrix.compiler }}-${{ steps.cmake-hash.outputs.hash }}-
+            ccache-${{ runner.os }}-${{ matrix.os }}-${{ matrix.compiler }}-
+
+      - name: Install compiler and tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y ${{ matrix.cc }}
+          fi
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ccache ninja llvm
+
+      - name: Set up compiler env
+        run: |
+          resolve_tool() {
+            if [ -x "$1" ]; then printf '%s\n' "$1"; else command -v "$1"; fi
+          }
+          echo "CC=$(resolve_tool "${{ matrix.cc }}")" >> $GITHUB_ENV
+          echo "CXX=$(resolve_tool "${{ matrix.cxx }}")" >> $GITHUB_ENV
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build-test \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DWIRESTEAD_ENABLE_CONFIG=ON \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Configure CMake (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          cmake -S . -B build-test \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$SDK_VER" \
+            -DWIRESTEAD_ENABLE_CONFIG=ON \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build tests
+        run: cmake --build build-test -j ${CORE_COUNT:-4}
+
+      - name: Run unit tests
+        run: |
+          cd build-test
+          ctest --output-on-failure --parallel ${CORE_COUNT:-2} \
+            --label-regex "unit|core|memory|config" || \
+          ctest --rerun-failed --output-on-failure --parallel ${CORE_COUNT:-2}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: unit-test-results-${{ matrix.os }}-${{ matrix.compiler }}
+          path: build-test/Testing/
+          retention-days: 7
+          overwrite: true
+
+  # ── WINDOWS (Release + smoke tests, x64 and ARM64) ───────────────────────────
+  windows:
+    name: Windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022,   cmake_arch: x64,   triplet: x64-windows   }
+          - { os: windows-11-arm, cmake_arch: ARM64,  triplet: arm64-windows }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tools
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      # A short root keeps the vcpkg buildtrees clear of the Windows path limit.
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+          vcpkg-root: C:/vcpkg-pinned
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" -A ${{ matrix.cmake_arch }} `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CXX_STANDARD=${{ env.CXX_STANDARD }} `
+            -DWIRESTEAD_ENABLE_CONFIG=ON `
+            -DWIRESTEAD_BUILD_TESTS=ON `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Smoke tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure `
+            --label-exclude "performance|benchmark|stress|slow|serial"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-build-${{ matrix.os }}
+          path: build/
+          retention-days: 7
+          overwrite: true
+
+  # ── TLS ───────────────────────────────────────────────────────────────────────
+  # WIRESTEAD_ENABLE_TLS is off by default, so without this job the TLS code is
+  # a configuration nobody compiles and nothing would catch it rotting.
+  tls-tests:
+    name: TLS (ubuntu-24.04, gcc)
+    runs-on: ubuntu-24.04
+    needs: [compile]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-tls-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: ccache-${{ runner.os }}-tls-
+
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: "build-essential cmake ccache libssl-dev"
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: x64-linux
+
+      - name: Configure CMake with TLS
+        run: |
+          cmake -S . -B build-tls \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DWIRESTEAD_ENABLE_TLS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build with TLS
+        run: cmake --build build-tls -j $(nproc)
+
+      - name: Run TLS tests
+        run: ctest --test-dir build-tls --output-on-failure --parallel 2 -R "Tls"
+
+  # ── INTEGRATION TESTS ─────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests (ubuntu-24.04, gcc)
+    runs-on: ubuntu-24.04
+    needs: [compile]
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-integration-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: ccache-${{ runner.os }}-integration-
+
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: "build-essential cmake ccache"
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: x64-linux
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build-integration \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DWIRESTEAD_ENABLE_CONFIG=ON \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build integration tests
+        run: cmake --build build-integration -j $(nproc)
+
+      - name: Run integration tests
+        run: |
+          cd build-integration
+          ctest --output-on-failure --parallel 2 \
+            --label-regex "integration|mock|stable" \
+            --label-exclude "slow" || \
+          ctest --rerun-failed --output-on-failure --parallel 2 \
+            --label-regex "integration|mock|stable" \
+            --label-exclude "slow"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: integration-test-results
+          path: build-integration/Testing/
+          retention-days: 7
+          overwrite: true
+
+  integration-tests-arm64:
+    name: Integration Tests (ubuntu-24.04-arm, gcc)
+    runs-on: ubuntu-24.04-arm
+    needs: [compile]
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-integration-arm64-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: ccache-${{ runner.os }}-integration-arm64-
+
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: "build-essential cmake ccache socat"
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: arm64-linux
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build-integration-arm64 \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DWIRESTEAD_ENABLE_CONFIG=ON \
+            -DWIRESTEAD_BUILD_DOCS=OFF \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build integration tests
+        run: cmake --build build-integration-arm64 -j $(nproc)
+
+      - name: Run integration tests
+        run: |
+          cd build-integration-arm64
+          ctest --output-on-failure --parallel 2 \
+            --label-regex "integration|mock|stable" \
+            --label-exclude "slow" || \
+          ctest --rerun-failed --output-on-failure --parallel 2 \
+            --label-regex "integration|mock|stable" \
+            --label-exclude "slow"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: integration-test-results-ubuntu-24.04-arm-gcc
+          path: build-integration-arm64/Testing/
+          retention-days: 7
+          overwrite: true
+
+  # ── MEMORY SAFETY TESTS ───────────────────────────────────────────────────────
+  memory-safety-tests:
+    name: Memory Safety Tests
+    runs-on: ubuntu-24.04
+    needs: [compile]
+    timeout-minutes: 45
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: "build-essential cmake"
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: x64-linux
+
+      - name: Configure CMake with Sanitizers
+        run: |
+          cmake -S . -B build-sanitizer \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DWIRESTEAD_ENABLE_SANITIZERS=ON \
+            -DWIRESTEAD_ENABLE_MEMORY_TRACKING=ON \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,leak -fno-omit-frame-pointer -g" \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined,leak -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined,leak" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined,leak"
+
+      - name: Build with sanitizers
+        run: cmake --build build-sanitizer -j $(nproc)
+
+      - name: Run memory safety tests
+        run: |
+          cd build-sanitizer
+          ctest --output-on-failure --parallel $(nproc) \
+            --label-regex "memory|safety"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: memory-safety-test-results
+          path: build-sanitizer/Testing/
+          retention-days: 7
+          overwrite: true
+
+  # ── E2E TESTS ─────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-24.04
+    needs: [compile]
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: "build-essential cmake"
+
+      - name: Install dependencies with vcpkg
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: x64-linux
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-e2e \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_STANDARD=$CXX_STANDARD \
+            -DWIRESTEAD_ENABLE_CONFIG=ON \
+            -DWIRESTEAD_BUILD_TESTS=ON \
+            -DCMAKE_TOOLCHAIN_FILE=$CMAKE_TOOLCHAIN_FILE \
+            -DVCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET
+
+      - name: Build
+        run: cmake --build build-e2e -j $(nproc)
+
+      - name: Run E2E tests
+        run: |
+          cd build-e2e
+          ctest -L e2e --output-on-failure --parallel 2 || \
+          ctest -L e2e --rerun-failed --output-on-failure --parallel 2
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-test-results
+          path: build-e2e/Testing/
+          retention-days: 7
+          overwrite: true
+
+  # ── SUMMARY ───────────────────────────────────────────────────────────────────
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-24.04
+    needs: [compile, unit-tests, windows, integration-tests, integration-tests-arm64, memory-safety-tests, e2e-tests, tls-tests]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Compile | ${{ needs.compile.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Windows | ${{ needs.windows.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests | ${{ needs.integration-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TLS | ${{ needs.tls-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests ARM64 | ${{ needs.integration-tests-arm64.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Memory Safety Tests | ${{ needs.memory-safety-tests.result == 'success' && '✅' || needs.memory-safety-tests.result == 'skipped' && '⏭️' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Tests | ${{ needs.e2e-tests.result == 'success' && '✅' || needs.e2e-tests.result == 'skipped' && '⏭️' || '❌' }} |" >> $GITHUB_STEP_SUMMARY

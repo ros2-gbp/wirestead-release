@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>wirestead</name>
+  <version>0.9.6</version>
+  <description>Cross-platform asynchronous C++ communication library for serial, TCP, UDP, and UDS transports.</description>
+
+  <maintainer email="jwsung91@gmail.com">Jinwoo Sung</maintainer>
+  <license>Apache-2.0</license>
+
+  <url type="website">https://wirestead.github.io/</url>
+  <url type="repository">https://github.com/wirestead/wirestead</url>
+  <url type="bugtracker">https://github.com/wirestead/wirestead/issues</url>
+
+  <buildtool_depend>cmake</buildtool_depend>
+
+  <!-- Boost.Asio and Boost.System are header-only since 1.69, so Boost is a
+       build-time dependency only; libwirestead.so has no Boost NEEDED entry.
+       wiresteadConfig.cmake calls find_dependency(Boost COMPONENTS system),
+       so consumers need the same two at their build time. -->
+  <build_depend>libboost-dev</build_depend>
+  <build_depend>libboost-system-dev</build_depend>
+  <build_export_depend>libboost-dev</build_export_depend>
+  <build_export_depend>libboost-system-dev</build_export_depend>
+
+  <depend>spdlog</depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>

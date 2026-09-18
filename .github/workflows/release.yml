@@ -1,0 +1,355 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release (required when upload is true)'
+        required: false
+        default: 'v0.1.0-test'
+      upload:
+        description: 'Upload release assets to GitHub'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Build and Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      NONINTERACTIVE: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: Linux (Ubuntu 22.04)
+            os_label: ubuntu-22.04
+            triplet: x64-linux
+            cmake_generator: "Ninja"
+            cpack_generator: "TGZ"
+            release_files: |
+              build/package/wirestead-*.tar.gz
+
+          - os: ubuntu-22.04-arm
+            label: Linux ARM64 (Ubuntu 22.04)
+            os_label: ubuntu-22.04
+            triplet: arm64-linux
+            cmake_generator: "Ninja"
+            cpack_generator: "TGZ"
+            release_files: |
+              build/package/wirestead-*.tar.gz
+
+          - os: ubuntu-24.04
+            label: Linux (Ubuntu 24.04)
+            os_label: ubuntu-24.04
+            triplet: x64-linux
+            cmake_generator: "Ninja"
+            cpack_generator: "TGZ"
+            release_files: |
+              build/package/wirestead-*.tar.gz
+
+          - os: ubuntu-24.04-arm
+            label: Linux ARM64 (Ubuntu 24.04)
+            os_label: ubuntu-24.04
+            triplet: arm64-linux
+            cmake_generator: "Ninja"
+            cpack_generator: "TGZ"
+            release_files: |
+              build/package/wirestead-*.tar.gz
+
+          - os: macos-15
+            label: macOS 15
+            os_label: macos-15
+            triplet: arm64-osx
+            cmake_generator: "Ninja"
+            cpack_generator: "TGZ;DragNDrop"
+            release_files: |
+              build/package/wirestead-*.tar.gz
+              build/package/wirestead-*.dmg
+
+          - os: windows-2022
+            label: Windows (VS 2022)
+            os_label: windows
+            cmake_generator: "Visual Studio 17 2022"
+            cmake_arch: "x64"
+            triplet: x64-windows
+            cpack_generator: "ZIP"
+            release_files: |
+              build/package/wirestead-*.zip
+
+          - os: windows-11-arm
+            label: Windows ARM64
+            os_label: windows
+            cmake_generator: "Visual Studio 17 2022"
+            cmake_arch: "ARM64"
+            triplet: arm64-windows
+            cpack_generator: "ZIP"
+            release_files: |
+              build/package/wirestead-*.zip
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up C++ toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          sudo apt-get update --allow-releaseinfo-change
+          sudo apt-get install -y build-essential cmake ninja-build
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CXX=g++" >> "$GITHUB_ENV"
+
+      - name: Set up C++ toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Install dependencies with vcpkg (Unix)
+        if: runner.os != 'Windows'
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+
+      - name: Prepare Keychain (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+
+      - name: Set up C++ toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ninja --no-progress -y
+
+      # A short root keeps the vcpkg buildtrees clear of the Windows path limit.
+      - name: Install dependencies with vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-vcpkg
+        with:
+          triplet: ${{ matrix.triplet }}
+          vcpkg-root: C:/vcpkg-pinned
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cmake -S . -B build -G "${{ matrix.cmake_generator }}" -A "${{ matrix.cmake_arch }}" \
+              -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+              -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" \
+              -DWIRESTEAD_BUILD_TESTS=ON \
+              -DWIRESTEAD_ENABLE_INSTALL=ON \
+              -DWIRESTEAD_ENABLE_PKGCONFIG=ON \
+              -DWIRESTEAD_ENABLE_EXPORT_HEADER=ON \
+              -DWIRESTEAD_OS_LABEL="${{ matrix.os_label }}"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+            cmake -S . -B build -G "${{ matrix.cmake_generator }}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$SDK_VER" \
+              -DWIRESTEAD_BUILD_TESTS=ON \
+              -DWIRESTEAD_ENABLE_INSTALL=ON \
+              -DWIRESTEAD_ENABLE_PKGCONFIG=ON \
+              -DWIRESTEAD_ENABLE_EXPORT_HEADER=ON \
+              -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE}" \
+              -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}" \
+              -DWIRESTEAD_OS_LABEL="${{ matrix.os_label }}"
+          else
+            cmake -S . -B build -G "${{ matrix.cmake_generator }}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER="${CC}" \
+              -DCMAKE_CXX_COMPILER="${CXX}" \
+              -DWIRESTEAD_BUILD_TESTS=ON \
+              -DWIRESTEAD_ENABLE_INSTALL=ON \
+              -DWIRESTEAD_ENABLE_PKGCONFIG=ON \
+              -DWIRESTEAD_ENABLE_EXPORT_HEADER=ON \
+              -DCMAKE_TOOLCHAIN_FILE="${CMAKE_TOOLCHAIN_FILE}" \
+              -DVCPKG_TARGET_TRIPLET="${VCPKG_TARGET_TRIPLET}" \
+              -DWIRESTEAD_OS_LABEL="${{ matrix.os_label }}"
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          BUILD_ARGS="--config Release --verbose"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # Capped (not sysctl -n hw.ncpu) to match ci.yml's macOS Unit Tests
+            # job: full parallelism let ninja's gtest_discover_tests POST_BUILD
+            # step race other link/discovery jobs for CPU time, intermittently
+            # failing to produce its test-list JSON on a different test binary
+            # each run (observed across 3 consecutive release.yml runs for v0.8.9).
+            BUILD_ARGS="$BUILD_ARGS --parallel 4"
+          else
+            BUILD_ARGS="$BUILD_ARGS --parallel"
+          fi
+          cmake --build build $BUILD_ARGS
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure -C Release || \
+          ctest --test-dir build --rerun-failed --output-on-failure -C Release
+
+      - name: Package
+        shell: bash
+        run: |
+          cd build
+          for attempt in 1 2 3; do
+            if cpack -C Release -B package -G "${{ matrix.cpack_generator }}"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "CPack failed after 3 attempts"
+              exit 1
+            fi
+            echo "CPack attempt $attempt failed, retrying in $((attempt * 10))s..."
+            sleep $((attempt * 10))
+            rm -rf package
+          done
+          ls -la package/
+
+      - name: Verify package files exist
+        shell: bash
+        run: |
+          echo "Package directory:"
+          ls -la build/package
+
+          count=$(find build/package -maxdepth 1 -type f \( -name "wirestead-*.tar.gz" -o -name "wirestead-*.zip" -o -name "wirestead-*.dmg" \) | wc -l | tr -d ' ')
+          if [ "$count" -eq 0 ]; then
+            echo "No release package files found"
+            exit 1
+          fi
+
+          echo "Release package files:"
+          find build/package -maxdepth 1 -type f \( -name "wirestead-*.tar.gz" -o -name "wirestead-*.zip" -o -name "wirestead-*.dmg" \) -print | sort
+
+      - name: Verify package contents (TGZ)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          pkg=$(find build/package -maxdepth 1 -name 'wirestead-*.tar.gz' | head -n1)
+          if [ -z "$pkg" ]; then
+            echo "No TGZ package found"
+            exit 1
+          fi
+
+          echo "Checking package: $pkg"
+          tar -tzf "$pkg" | tee package-files.txt | sed -n '1,80p'
+
+          grep -E '/include/wirestead/wirestead.hpp$' package-files.txt
+          grep -E '/include/unilink/unilink.hpp$' package-files.txt
+          grep -E '/lib/(lib)?wirestead[^/]*\.(a|so|dylib)(\.[0-9.]+)?$|/bin/wirestead[^/]*\.(dll|exe)$' package-files.txt
+          grep -E '/unilinkConfig\.cmake$' package-files.txt
+          grep -E '/wiresteadConfig\.cmake$' package-files.txt
+          grep -E '/wiresteadTargets\.cmake$' package-files.txt
+          grep -E '/unilink\.pc$' package-files.txt
+          grep -E '/wirestead\.pc$' package-files.txt
+          grep -E '/LICENSE$' package-files.txt
+          grep -E '/NOTICE$' package-files.txt
+          grep -E '/README\.md$' package-files.txt
+
+          if grep -E '/lib/(lib)?unilink[^/]*\.(a|so|dylib)(\.[0-9.]+)?$|/bin/unilink[^/]*\.(dll|exe)$' package-files.txt; then
+            echo "Unexpected legacy libunilink binary compatibility artifact found"
+            exit 1
+          fi
+
+      - name: Verify package contents (ZIP)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem build/package -Filter "wirestead-*.zip" | Select-Object -First 1
+          if (-not $pkg) {
+            Write-Error "No ZIP package found"
+            exit 1
+          }
+
+          Write-Host "Checking package: $($pkg.FullName)"
+          $dest = "build/package-check"
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          New-Item -ItemType Directory -Path $dest | Out-Null
+
+          Expand-Archive -Path $pkg.FullName -DestinationPath $dest
+
+          Get-ChildItem -Recurse $dest | Select-Object -First 80 | ForEach-Object { $_.FullName }
+
+          $libraryFiles = Get-ChildItem -Recurse $dest | Where-Object {
+            $_.FullName -match '[\\/](lib|bin)[\\/]' -and $_.Name -match '^(wirestead|libwirestead).*\.(dll|lib|a)$'
+          }
+          if (-not $libraryFiles) {
+            Write-Error "Missing wirestead library output under lib/ or bin/"
+            exit 1
+          }
+          $legacyLibraryFiles = Get-ChildItem -Recurse $dest | Where-Object {
+            $_.FullName -match '[\\/](lib|bin)[\\/]' -and $_.Name -match '^(unilink|libunilink).*\.(dll|lib|a)$'
+          }
+          if ($legacyLibraryFiles) {
+            Write-Error "Unexpected legacy libunilink binary compatibility artifact found"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "wirestead.hpp")) {
+            Write-Error "Missing wirestead.hpp"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "unilink.hpp" | Where-Object { $_.FullName -match '[\\/]unilink[\\/]' })) {
+            Write-Error "Missing legacy unilink.hpp"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "unilinkConfig.cmake")) {
+            Write-Error "Missing unilinkConfig.cmake"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "wiresteadConfig.cmake")) {
+            Write-Error "Missing wiresteadConfig.cmake"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "wiresteadTargets.cmake")) {
+            Write-Error "Missing wiresteadTargets.cmake"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "LICENSE")) {
+            Write-Error "Missing LICENSE"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "NOTICE")) {
+            Write-Error "Missing NOTICE"
+            exit 1
+          }
+          if (-not (Get-ChildItem -Recurse $dest -Filter "README.md")) {
+            Write-Error "Missing README.md"
+            exit 1
+          }
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "## Release Summary - ${{ matrix.os }}" >> $GITHUB_STEP_SUMMARY
+          echo "Build: Success" >> $GITHUB_STEP_SUMMARY
+          echo "Tests: Passed" >> $GITHUB_STEP_SUMMARY
+          echo "Package: Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Package files" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          find build/package -maxdepth 1 -type f -name "wirestead-*" -print | sort >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Release Asset
+        if: github.event_name == 'push' || inputs.upload == true || inputs.upload == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ matrix.release_files }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          draft: true
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

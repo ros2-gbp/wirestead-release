@@ -1,0 +1,64 @@
+name: Code Quality
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+  workflow_call:
+
+jobs:
+  # Code Formatting Check
+  formatting:
+    name: Code Formatting
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+
+    - name: Install formatters
+      run: pip install clang-format==18.1.3 cmakelang==0.6.13
+
+    - name: Run formatting style check
+      run: |
+        find . -regex '.*\.\(cpp\|hpp\|cu\|c\|h\|cc\|hh\)' -not -path "./build/*" -not -path "./_deps/*" -exec clang-format -style=file -i {} \;
+        find . -type f \( -name "CMakeLists.txt" -o -name "*.cmake" -o -name "*.cmake.in" \) -not -path "*/build/*" -not -path "*/.git/*" -not -path "*/.vscode/*" -exec cmake-format -i {} \;
+        git diff --exit-code
+
+  # Quality Summary
+  quality-summary:
+    name: Quality Summary
+    runs-on: ubuntu-22.04
+    needs: [formatting]
+    if: always()
+
+    steps:
+    - name: Quality Summary
+      run: |
+        echo "## Code Quality Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Formatting | ${{ needs.formatting.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
