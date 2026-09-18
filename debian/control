@@ -1,0 +1,12 @@
+Source: ros-jazzy-wirestead
+Section: misc
+Priority: optional
+Maintainer: "Jinwoo Sung" <jwsung91@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, libboost-dev, libboost-system-dev, libspdlog-dev, ros-jazzy-ros-workspace
+Homepage: https://wirestead.github.io/
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-wirestead
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libboost-dev, libboost-system-dev, libspdlog-dev, ros-jazzy-ros-workspace
+Description: Cross-platform asynchronous C++ communication library for serial, TCP, UDP, and UDS transports.
