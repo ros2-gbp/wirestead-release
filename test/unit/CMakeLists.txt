@@ -79,7 +79,6 @@ foreach(
   test_error_codes_to_string.cc
   test_error_mapping_edge_cases.cc
   test_memory_pool_edge_cases.cc
-  test_legacy_compat.cc
 )
   get_filename_component(test_name ${test_file} NAME_WE)
 
@@ -87,11 +86,7 @@ foreach(
   if(test_name STREQUAL "test_core")
     set(resource_lock "log_file_io")
   endif()
-  if(test_name STREQUAL "test_legacy_compat")
-    set(test_labels "legacy_compat")
-  else()
-    set(test_labels "unit_common_fast")
-  endif()
+  set(test_labels "unit_common_fast")
   wirestead_add_unit_gtest(
     run_unit_${test_name} ${CMAKE_CURRENT_SOURCE_DIR}/common/${test_file}
     "${test_labels}" 30 "${resource_lock}"
@@ -136,6 +131,22 @@ wirestead_add_unit_gtest(
   "unit_diagnostics_fast" 30
 )
 
+wirestead_add_unit_gtest(
+  run_unit_test_send_accounting
+  ${CMAKE_CURRENT_SOURCE_DIR}/diagnostics/test_send_accounting.cc
+  "unit_diagnostics_fast" 30
+)
+
+# Replaces global operator new, which TSan's runtime also defines.
+if(NOT WIRESTEAD_ENABLE_TSAN)
+  wirestead_add_unit_gtest(
+    run_unit_test_send_accounting_alloc_failure
+    ${CMAKE_CURRENT_SOURCE_DIR}/diagnostics/test_send_accounting_alloc_failure.cc
+    "unit_diagnostics_fast"
+    30
+  )
+endif()
+
 # Wrapper tests (separate executables across TCP/UDP/UDS/Serial)
 foreach(
   test_file
@@ -147,6 +158,15 @@ foreach(
   test_message_context.cc
   test_batch_latency_flush.cc
   test_backpressure_getters.cc
+  test_callback_blocking_send.cc
+  test_receive_budget.cc
+  test_bounded_receive.cc
+  test_lifecycle_events.cc
+  test_config_policy.cc
+  test_send_result.cc
+  test_connection_channel.cc
+  test_client_send_results.cc
+  test_send_payload_validation.cc
 )
   get_filename_component(test_name ${test_file} NAME_WE)
 
@@ -167,6 +187,12 @@ foreach(
   )
 endforeach()
 
+# Callback gate (D-1)
+wirestead_add_unit_gtest(
+  run_unit_wrapper_callback_gate
+  ${CMAKE_CURRENT_SOURCE_DIR}/wrapper/test_callback_gate.cc "unit_wrapper" 30
+)
+
 # Wrapper serial config mapping
 wirestead_add_unit_gtest(
   run_unit_wrapper_serial_config_mapping
@@ -176,8 +202,11 @@ wirestead_add_unit_gtest(
 
 # Transport tests (fast, unit-level without real network dependencies) Updated
 # list to include fuzz tests, server session tests, and timeout tests
-foreach(test_file transport_uds_client.cc transport_uds_server.cc
-                  transport_serial.cc transport_uds_session_lifecycle.cc
+foreach(
+  test_file
+  transport_uds_client.cc transport_uds_server.cc transport_serial.cc
+  transport_uds_session_lifecycle.cc transport_stream_send_accounting.cc
+  transport_session_send_accounting.cc
 )
   get_filename_component(test_name ${test_file} NAME_WE)
 
