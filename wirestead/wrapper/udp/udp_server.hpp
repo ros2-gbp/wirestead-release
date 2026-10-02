@@ -25,6 +25,7 @@
 #include "wirestead/base/visibility.hpp"
 #include "wirestead/config/udp_config.hpp"
 #include "wirestead/wrapper/iserver.hpp"
+#include "wirestead/wrapper/receive_limits.hpp"
 
 namespace wirestead {
 namespace interface {
@@ -56,22 +57,28 @@ class WIRESTEAD_API UdpServer : public ServerInterface {
   void stop() override;
   bool listening() const override;
   RuntimeStats stats() const override;
+  /// Configure library receive storage while stopped. Custom framer internals are excluded.
+  UdpServer& receive_limits(ReceiveLimits limits);
+  ReceiveMemoryStats receive_stats() const;
+  std::optional<RuntimeStats> client_stats(ClientId client_id) const override;
   void reset_stats() override;
 
   // Transmission
-  bool broadcast(std::string_view data) override;
-  bool send_to(ClientId client_id, std::string_view data) override;
-  bool send_to_blocking(ClientId client_id, std::string_view data) override;
-  bool try_send_to(ClientId client_id, std::string_view data) override;
-  bool try_broadcast(std::string_view data) override;
-  bool broadcast_line(std::string_view line) override;
-  bool send_to_line(ClientId client_id, std::string_view line) override;
-  bool try_broadcast_line(std::string_view line) override;
-  bool try_send_to_line(ClientId client_id, std::string_view line) override;
+  [[nodiscard]] FanoutResult broadcast(std::string_view data) override;
+  [[nodiscard]] SendResult send_to(ClientId client_id, std::string_view data) override;
+  [[nodiscard]] SendResult send_to_blocking(ClientId client_id, std::string_view data) override;
+  [[nodiscard]] SendResult try_send_to(ClientId client_id, std::string_view data) override;
+  [[nodiscard]] FanoutResult try_broadcast(std::string_view data) override;
+  [[nodiscard]] FanoutResult broadcast_line(std::string_view line) override;
+  [[nodiscard]] SendResult send_to_line(ClientId client_id, std::string_view line) override;
+  [[nodiscard]] FanoutResult try_broadcast_line(std::string_view line) override;
+  [[nodiscard]] SendResult try_send_to_line(ClientId client_id, std::string_view line) override;
 
   // Event handlers
   UdpServer& on_connect(ConnectionHandler handler) override;
   UdpServer& on_disconnect(ConnectionHandler handler) override;
+  /// Idle expiry of a local virtual session; does not imply remote disconnect.
+  UdpServer& on_session_expired(ConnectionHandler handler);
   UdpServer& on_data(MessageHandler handler) override;
   UdpServer& on_data_batch(BatchMessageHandler handler) override;
   UdpServer& on_error(ErrorHandler handler) override;
@@ -93,7 +100,8 @@ class WIRESTEAD_API UdpServer : public ServerInterface {
    *
    * A value of 0ms disables idle timeout. When enabled, stale UDP virtual
    * sessions are removed and a later datagram from the same endpoint creates a
-   * new virtual session.
+   * new virtual session. Expiry discards accepted writes that have not started;
+   * an active datagram retains its actual completion outcome.
    */
   UdpServer& idle_timeout(std::chrono::milliseconds timeout);
   UdpServer& max_clients(size_t max);

@@ -26,6 +26,8 @@
 #include "wirestead/config/uds_config.hpp"
 #include "wirestead/diagnostics/error_types.hpp"
 #include "wirestead/interface/channel.hpp"
+#include "wirestead/wrapper/fanout_result.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 namespace boost {
 namespace asio {
@@ -39,7 +41,11 @@ namespace interface {
 class UdsAcceptorInterface;
 }
 
+namespace wrapper {
+class UdsServer;
+}
 namespace transport {
+class UdsServerSession;
 
 /**
  * @brief Thread-safe UDS Server implementation
@@ -66,8 +72,13 @@ class WIRESTEAD_API UdsServer : public interface::Channel, public std::enable_sh
   bool is_connected() const override;
   bool is_backpressure_active() const override;
   bool is_backpressure_active(ClientId client_id) const;
+  // Per-session hard queue limit; nullopt if the client ID is absent.
+  std::optional<size_t> write_queue_limit(ClientId client_id) const;
+  using interface::Channel::write_queue_limit;
   boost::asio::any_io_executor get_executor() override;
   bool async_write_copy(memory::ConstByteSpan data) override;
+  // Fanout move: consume only if at least one session accepts; otherwise
+  // return false with the source contents unchanged.
   bool async_write_move(std::vector<uint8_t>&& data) override;
   bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
   bool async_try_write_copy(memory::ConstByteSpan data) override;
@@ -103,6 +114,17 @@ class WIRESTEAD_API UdsServer : public interface::Channel, public std::enable_sh
   base::LinkState state() const;
 
  private:
+  friend class wrapper::UdsServer;
+  void fail_receive(ClientId id);
+  wrapper::FanoutResult broadcast_result(memory::ConstByteSpan data, wrapper::SendResult wrapper_state,
+                                         bool append_newline);
+  wrapper::SendResult target_state() const;
+  std::shared_ptr<UdsServerSession> capture_target(ClientId client_id) const;
+  std::optional<boost::asio::any_io_executor> client_executor(ClientId client_id) const;
+  std::optional<wrapper::SendResult> poll_target_wait(const std::shared_ptr<UdsServerSession>& session) const;
+  void cancel_target_waits();
+  wrapper::SendResult write_target(ClientId client_id, memory::ConstByteSpan data, bool try_only,
+                                   const std::shared_ptr<UdsServerSession>& expected = {});
   explicit UdsServer(const config::UdsServerConfig& cfg);
   UdsServer(const config::UdsServerConfig& cfg, std::unique_ptr<interface::UdsAcceptorInterface> acceptor,
             boost::asio::io_context& ioc);

@@ -17,6 +17,9 @@
 #include "wirestead/transport/uds/uds_client.hpp"
 
 #include "wirestead/concurrency/io_thread_hook.hpp"
+#include "wirestead/config/validation.hpp"
+#include "wirestead/diagnostics/callback.hpp"
+#include "wirestead/diagnostics/send_accounting.hpp"
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Wsign-conversion"
@@ -28,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <boost/asio.hpp>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -44,8 +48,10 @@
 #include "wirestead/transport/base/bp_state_machine.hpp"
 #include "wirestead/transport/base/bp_utils.hpp"
 #include "wirestead/transport/base/error_info_holder.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
 #include "wirestead/transport/uds/boost_uds_socket.hpp"
 #include "wirestead/transport/uds/detail/reconnect_decider.hpp"
+#include "wirestead/transport/uds/detail/write_wait.hpp"
 
 namespace wirestead {
 namespace transport {
@@ -65,6 +71,8 @@ struct UdsClient::Impl {
   std::unique_ptr<net::executor_work_guard<net::io_context::executor_type>> work_guard_;
   std::jthread ioc_thread_;
   std::atomic<uint64_t> current_seq_{0};
+  std::atomic<uint64_t> connection_seq_{0};
+  std::shared_ptr<detail::UdsWriteWait> write_wait_;
   std::unique_ptr<interface::UdsSocketInterface> socket_;
   // Guards the mutable subset of cfg_ (retry_interval_ms, etc.) and
   // reconnect_policy_ below - see the identical rationale in
@@ -86,17 +94,85 @@ struct UdsClient::Impl {
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> stopping_{false};
 
+  std::mutex stop_mtx_;
+  std::condition_variable stop_cv_;
+  bool cleanup_done_ = false;
+  bool cleanup_finished_ = false;
+  size_t pending_io_ = 0;  // Strand-confined, including completion destruction.
+  std::mutex join_mtx_;
+  // Order accepted write submissions before the cleanup post. A caller
+  // that passed a fast precheck must not post old work after completion.
+  std::mutex submission_mtx_;
+
+  // Caller holds submission_mtx_: state, connection and admission are one decision.
+  std::optional<wrapper::SendRejection> admission_rejection(
+      std::optional<uint64_t> expected_connection = std::nullopt) {
+    if (stop_requested_.load()) {
+      std::lock_guard<std::mutex> lock(stop_mtx_);
+      return cleanup_done_ ? wrapper::SendRejection::NotStarted : wrapper::SendRejection::Stopping;
+    }
+    if (current_seq_.load() == 0) return wrapper::SendRejection::NotStarted;
+    if ((expected_connection && *expected_connection != connection_seq_.load()) || state_.is_state(LinkState::Closed) ||
+        state_.is_state(LinkState::Error) || !ioc_ || !connected_.load()) {
+      return wrapper::SendRejection::NotReady;
+    }
+    return std::nullopt;
+  }
+
+  void mark_cleanup_done() {
+    detail::stop_test_hook(this, true);
+    if (owns_ioc_) work_guard_.reset();
+    {
+      std::lock_guard<std::mutex> lock(stop_mtx_);
+      cleanup_done_ = true;
+    }
+    stop_cv_.notify_all();
+  }
+
+  // The socket interface erases executor associations into std::function.
+  // Explicit dispatch preserves serialization. The lifetime also accounts for
+  // test sockets that discard an operation instead of invoking its handler.
+  template <typename Handler>
+  auto track_io(std::shared_ptr<UdsClient> self, Handler handler) {
+    ++pending_io_;
+    std::shared_ptr<void> lifetime(nullptr, [self](void*) {
+      net::dispatch(self->impl_->strand_, [self] {
+        auto* impl = self->impl_.get();
+        if (impl->cleanup_finished_ && impl->pending_io_ == 1) {
+          if (auto hook = detail::g_uds_io_completion_hook.load()) hook();
+        }
+        if (--impl->pending_io_ == 0 && impl->cleanup_finished_) impl->mark_cleanup_done();
+      });
+    });
+    return [self, lifetime, handler = std::move(handler)](auto... args) {
+      net::dispatch(self->impl_->strand_, [lifetime, handler, args...]() mutable { handler(args...); });
+    };
+  }
+
   // Sized from cfg_.read_buffer_size in init() rather than being a fixed
   // std::array, so a bulk-transfer workload can trade memory for fewer read
   // completions and callback dispatches.
-  std::vector<uint8_t> rx_;
-  std::deque<BufferVariant> tx_;
-  std::deque<BufferVariant> pending_;
+  std::shared_ptr<std::vector<uint8_t>> rx_;
+  using Ledger = diagnostics::SendAccountingLedger;
+  struct TrackedBuffer {
+    BufferVariant buffer;
+    Ledger::Request request;
+  };
+  struct BufferProjection {
+    const BufferVariant& operator()(const TrackedBuffer& item) const { return item.buffer; }
+  };
+  Ledger send_accounting_;
+  std::deque<TrackedBuffer> tx_;
+  std::deque<TrackedBuffer> pending_;
   std::atomic<size_t> pending_bytes_{0};
-  // Buffers handed to the in-flight gather write; current_write_views_
-  // points into the batch, so neither is touched while a write is in flight.
-  std::vector<BufferVariant> current_write_batch_;
-  std::vector<net::const_buffer> current_write_views_;
+  // Each completion retains its gather buffers across loss/reconnect. A stale
+  // completion may release its batch but must not mutate the new connection.
+  struct WriteBatch {
+    std::vector<TrackedBuffer> buffers;
+    std::vector<net::const_buffer> views;
+    size_t bytes = 0;
+  };
+  std::shared_ptr<WriteBatch> active_write_;
   bool writing_ = false;
   std::atomic<size_t> queue_bytes_{0};
   // Bytes accepted by a plain async_write_* call but not yet routed onto the
@@ -148,13 +224,27 @@ struct UdsClient::Impl {
     init();
   }
 
+  void mark_disconnected() {
+    std::lock_guard<std::mutex> lock(submission_mtx_);
+    mark_disconnected_locked();
+  }
+  void mark_disconnected_locked() {
+    if (connected_.exchange(false)) {
+      send_accounting_.end(Ledger::Cause::ConnectionLoss);
+      if (write_wait_) write_wait_->end(wrapper::SendRejection::NotReady);
+      connection_seq_.fetch_add(1);
+    }
+  }
+
+  void discard_connection_writes();
+
   void init() {
     connected_ = false;
     writing_ = false;
     queue_bytes_ = 0;
     pending_bytes_ = 0;
-    cfg_.validate_and_clamp();
-    rx_.resize(cfg_.read_buffer_size);
+    config::detail::validate(cfg_);
+    rx_ = std::make_shared<std::vector<uint8_t>>(cfg_.read_buffer_size);
     recalculate_backpressure_bounds();
   }
 
@@ -164,13 +254,13 @@ struct UdsClient::Impl {
   void do_write(std::shared_ptr<UdsClient> self, uint64_t seq);
   void handle_close(std::shared_ptr<UdsClient> self, uint64_t seq, const boost::system::error_code& ec = {});
   void transition_to(LinkState next, const boost::system::error_code& ec = {});
-  void perform_stop_cleanup(uint64_t seq);
+  void perform_stop_cleanup();
   void close_socket();
   void recalculate_backpressure_bounds();
   void report_backpressure(std::shared_ptr<UdsClient> self, size_t queued_bytes);
   void observe_queue();
   // Shared decide_enqueue()/route dispatch used by both async_write_* variants (#434).
-  void route_enqueued_buffer(std::shared_ptr<UdsClient> self, BufferVariant&& buf, size_t added);
+  void route_enqueued_buffer(std::shared_ptr<UdsClient> self, TrackedBuffer&& buf, size_t added);
   queue_util::BackpressureFields bp_fields();
   void record_error(diagnostics::ErrorLevel lvl, diagnostics::ErrorCategory cat, std::string_view operation,
                     const boost::system::error_code& ec, std::string_view msg, bool retryable, uint32_t retry_count);
@@ -249,6 +339,13 @@ void UdsClient::start() {
   impl_->recalculate_backpressure_bounds();
   impl_->stop_requested_ = false;
   impl_->stopping_ = false;
+  {
+    std::lock_guard<std::mutex> lock(impl_->stop_mtx_);
+    impl_->cleanup_done_ = false;
+  }
+  impl_->cleanup_finished_ = false;
+  impl_->inflight_bytes_ = 0;
+  impl_->active_write_.reset();
   impl_->current_seq_++;
   uint64_t seq = impl_->current_seq_.load();
 
@@ -269,141 +366,342 @@ void UdsClient::start() {
   }
 
   net::post(impl_->strand_, [self = shared_from_this(), seq]() {
+    if (self->impl_->stop_requested_ || seq != self->impl_->current_seq_) return;
     self->impl_->transition_to(LinkState::Connecting);
     self->impl_->do_connect(self, seq);
   });
 }
 
 void UdsClient::stop() {
-  bool already_stopping = impl_->stopping_.exchange(true);
-  if (already_stopping) return;
-
-  impl_->stop_requested_ = true;
-  impl_->connected_ = false;
-  const auto seq = impl_->current_seq_.fetch_add(1) + 1;
-
-  // Release work guard and allow io_context to run out of work
-  if (impl_->ioc_) {
-    if (auto self = weak_from_this().lock()) {
-      net::post(impl_->strand_, [self, seq]() { self->impl_->perform_stop_cleanup(seq); });
-    } else {
-      impl_->perform_stop_cleanup(seq);
-    }
-  } else {
-    impl_->perform_stop_cleanup(seq);
-  }
-
-  if (impl_->owns_ioc_ && impl_->ioc_thread_.joinable()) {
-    if (std::this_thread::get_id() == impl_->ioc_thread_.get_id()) {
-      impl_->ioc_thread_.detach();
-    } else {
-      impl_->ioc_thread_.join();
+  const bool on_executor = impl_->ioc_->get_executor().running_in_this_thread();
+  {
+    std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+    if (!impl_->stop_requested_.exchange(true)) {
+      impl_->send_accounting_.end(Impl::Ledger::Cause::ExplicitStop);
+      if (impl_->write_wait_) impl_->write_wait_->end(wrapper::SendRejection::CancelledWhileWaiting);
+      impl_->stopping_ = true;
+      impl_->connected_ = false;
+      if (impl_->current_seq_.load() == 0) {
+        impl_->perform_stop_cleanup();
+      } else {
+        auto self = weak_from_this().lock();
+        auto* impl = impl_.get();
+        net::post(impl_->strand_, [self, impl] { impl->perform_stop_cleanup(); });
+      }
     }
   }
+  if (on_executor) return;
 
-  // Transition to Idle state (lock-free or safe call)
-  impl_->state_.set(LinkState::Idle);
+  detail::stop_test_hook(impl_.get(), false);
+  {
+    std::unique_lock<std::mutex> lock(impl_->stop_mtx_);
+    impl_->stop_cv_.wait(lock, [this] { return impl_->cleanup_done_; });
+  }
+  std::lock_guard<std::mutex> join_lock(impl_->join_mtx_);
+  if (impl_->owns_ioc_ && impl_->ioc_thread_.joinable()) impl_->ioc_thread_.join();
 }
 
 bool UdsClient::is_connected() const { return impl_->connected_.load(); }
 bool UdsClient::is_backpressure_active() const { return impl_->backpressure_active_.load(); }
+std::optional<size_t> UdsClient::write_queue_limit() const { return impl_->bp_limit_; }
 wrapper::RuntimeStats UdsClient::stats() const {
-  return impl_->stats_.snapshot(impl_->queue_bytes_.load(std::memory_order_relaxed),
-                                impl_->pending_bytes_.load(std::memory_order_relaxed),
-                                impl_->backpressure_active_.load(std::memory_order_relaxed));
+  auto result = impl_->stats_.snapshot(impl_->queue_bytes_.load(std::memory_order_relaxed),
+                                       impl_->pending_bytes_.load(std::memory_order_relaxed),
+                                       impl_->backpressure_active_.load(std::memory_order_relaxed));
+  result.send_accounting = impl_->send_accounting_.snapshot();
+  return result;
 }
 void UdsClient::reset_stats() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  impl_->send_accounting_.reset();
   impl_->stats_.reset(impl_->queue_bytes_.load(std::memory_order_relaxed) +
                       impl_->pending_bytes_.load(std::memory_order_relaxed));
 }
 
+void UdsClient::fail_receive() {
+  const auto connection = write_connection();
+  if (!connection) return;
+  const auto run = impl_->current_seq_.load();
+  net::dispatch(impl_->strand_, [self = shared_from_this(), connection, run] {
+    if (run != self->impl_->current_seq_.load() || self->write_connection() != connection) return;
+    self->impl_->handle_close(self, run, make_error_code(boost::system::errc::no_buffer_space));
+  });
+}
+
 boost::asio::any_io_executor UdsClient::get_executor() { return impl_->strand_; }
 
-bool UdsClient::async_write_copy(memory::ConstByteSpan data) {
-  size_t size = data.size();
-  if (impl_->cfg_.enable_memory_pool && size > 0 && size <= 65536) {
-    if (!impl_->connected_.load() || impl_->stop_requested_.load()) {
-      impl_->stats_.record_failed_send();
-      return false;
-    }
-    memory::PooledBuffer pooled(size, impl_->pool_);
-    if (pooled.valid()) {
-      base::safe_memory::safe_memcpy(pooled.data(), data.data(), size);
-      if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
-                                               impl_->inflight_bytes_, size, impl_->bp_limit_)) {
-        impl_->stats_.record_failed_send();
-        return false;
-      }
-      impl_->stats_.record_accepted(size);
-      net::post(impl_->strand_, [this, self = shared_from_this(), buf = std::move(pooled)]() mutable {
-        size_t added = buf.size();
-        impl_->route_enqueued_buffer(self, BufferVariant{std::move(buf)}, added);
-      });
-      return true;
-    }
-  }
-
-  std::vector<uint8_t> vec(data.begin(), data.end());
-  return async_write_move(std::move(vec));
+std::shared_ptr<detail::UdsWriteWait> UdsClient::capture_write_wait() const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->stop_requested_.load() || !impl_->connected_.load()) return {};
+  return impl_->write_wait_;
 }
 
-bool UdsClient::async_write_move(std::vector<uint8_t>&& data) {
-  if (!impl_->connected_.load() || impl_->stop_requested_.load()) {
-    impl_->stats_.record_failed_send();
-    return false;
+std::optional<wrapper::SendResult> UdsClient::poll_write_wait(const std::shared_ptr<detail::UdsWriteWait>& wait) const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (!wait) return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  if (wait->ended_by) return wrapper::SendResult::reject(*wait->ended_by);
+  if (wait->sequence != impl_->connection_seq_.load() || !impl_->connected_.load())
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  if (!impl_->backpressure_active_.load()) return wrapper::SendResult::accept();
+  return std::nullopt;
+}
+
+void UdsClient::cancel_write_waits() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->write_wait_) impl_->write_wait_->end(wrapper::SendRejection::CancelledWhileWaiting);
+}
+
+std::optional<uint64_t> UdsClient::write_connection() const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->stop_requested_.load() || !impl_->connected_.load()) return std::nullopt;
+  return impl_->connection_seq_.load();
+}
+
+wrapper::SendResult UdsClient::write_state() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (auto reason = impl_->admission_rejection()) return wrapper::SendResult::reject(*reason);
+  return wrapper::SendResult::accept();
+}
+
+wrapper::SendResult UdsClient::async_write_copy_result(memory::ConstByteSpan data) {
+  const auto result = write_copy(data, std::nullopt);
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult UdsClient::write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_uds_pinned_write_hook.load()) hook();
   }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_uds_write_admission_hook.load()) hook();
+
+  size_t size = data.size();
+  if (size == 0) {
+    WIRESTEAD_LOG_WARNING("uds_client", "async_write_copy", "Ignoring zero-length write");
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
+  }
+
+  if (size > base::constants::MAX_BUFFER_SIZE) {
+    WIRESTEAD_LOG_ERROR("uds_client", "async_write_copy",
+                        fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
+  }
+
+  if (size <= 65536 && impl_->cfg_.enable_memory_pool) {
+    try {
+      memory::PooledBuffer pooled_buffer(size, impl_->pool_);
+      if (pooled_buffer.valid()) {
+        base::safe_memory::safe_memcpy(pooled_buffer.data(), data.data(), size);
+        const auto added = pooled_buffer.size();
+        if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+                                                 impl_->inflight_bytes_, added, impl_->bp_limit_)) {
+          impl_->stats_.record_failed_send();
+          return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
+        }
+        impl_->stats_.record_accepted(added);
+        Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+        const auto request = admission.request();
+        net::post(impl_->strand_, [self = shared_from_this(), buf = std::move(pooled_buffer), added, seq, connection,
+                                   request]() mutable {
+          if (seq != self->impl_->current_seq_.load()) return;
+          if (connection != self->impl_->connection_seq_.load()) {
+            self->impl_->stats_.record_dropped(1, added);
+            queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_,
+                                                     added);
+            return;
+          }
+          self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+        });
+        admission.commit();
+        return wrapper::SendResult::accept();
+      }
+    } catch (const std::exception& e) {
+      WIRESTEAD_LOG_ERROR("uds_client", "async_write_copy",
+                          fmt::format("Failed to acquire pooled buffer: {}", e.what()));
+    }
+  }
+
+  std::vector<uint8_t> fallback(data.begin(), data.end());
+  const auto added = fallback.size();
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+                                           impl_->inflight_bytes_, added, impl_->bp_limit_)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
+  }
+  impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
+
+  net::post(impl_->strand_, [self = shared_from_this(), buf = std::move(fallback), added, seq, connection,
+                             request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+  });
+  admission.commit();
+  return wrapper::SendResult::accept();
+}
+
+wrapper::SendResult UdsClient::async_write_move_result(std::vector<uint8_t>&& data) {
+  const auto result = write_move(std::move(data), std::nullopt);
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult UdsClient::write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_uds_pinned_write_hook.load()) hook();
+  }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_uds_write_admission_hook.load()) hook();
+  const auto size = data.size();
+  if (size == 0) {
+    WIRESTEAD_LOG_WARNING("uds_client", "async_write_move", "Ignoring zero-length write");
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
+  }
+  if (size > base::constants::MAX_BUFFER_SIZE) {
+    WIRESTEAD_LOG_ERROR("uds_client", "async_write_move",
+                        fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
+  }
+
+  const auto added = size;
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+                                           impl_->inflight_bytes_, added, impl_->bp_limit_)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
+  }
+  impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
+  net::post(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added, seq, connection,
+                             request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+  });
+  admission.commit();
+  return wrapper::SendResult::accept();
+}
+
+wrapper::SendResult UdsClient::async_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) {
+  const auto result = write_shared(std::move(data), std::nullopt);
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult UdsClient::write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                            std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_uds_pinned_write_hook.load()) hook();
+  }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_uds_write_admission_hook.load()) hook();
+  if (!data || data->empty()) {
+    WIRESTEAD_LOG_WARNING("uds_client", "async_write_shared", "Ignoring empty shared buffer");
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
+  }
+  const auto size = data->size();
+  if (size > base::constants::MAX_BUFFER_SIZE) {
+    WIRESTEAD_LOG_ERROR("uds_client", "async_write_shared",
+                        fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
+  }
+
+  const auto added = size;
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+                                           impl_->inflight_bytes_, added, impl_->bp_limit_)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
+  }
+  impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
+  net::post(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added, seq, connection,
+                             request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+  });
+  admission.commit();
+  return wrapper::SendResult::accept();
+}
+
+wrapper::SendResult UdsClient::async_try_write_copy_result(memory::ConstByteSpan data) {
+  const auto result = try_write_copy(data);
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult UdsClient::try_write_copy(memory::ConstByteSpan data) {
   if (data.empty()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
-  const auto added = data.size();
-  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
-                                           impl_->inflight_bytes_, added, impl_->bp_limit_)) {
+  if (data.size() > base::constants::MAX_BUFFER_SIZE) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
-  impl_->stats_.record_accepted(added);
-  net::post(impl_->strand_, [this, self = shared_from_this(), data = std::move(data), added]() mutable {
-    impl_->route_enqueued_buffer(self, BufferVariant{std::move(data)}, added);
-  });
-  return true;
+  return try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
 }
 
-bool UdsClient::async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-  if (!impl_->connected_.load() || impl_->stop_requested_.load() || !data || data->empty()) {
-    impl_->stats_.record_failed_send();
-    return false;
-  }
-  const auto added = data->size();
-  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
-                                           impl_->inflight_bytes_, added, impl_->bp_limit_)) {
-    impl_->stats_.record_failed_send();
-    return false;
-  }
-  impl_->stats_.record_accepted(added);
-  net::post(impl_->strand_, [this, self = shared_from_this(), data = std::move(data), added]() mutable {
-    impl_->route_enqueued_buffer(self, BufferVariant{std::move(data)}, added);
-  });
-  return true;
+wrapper::SendResult UdsClient::async_try_write_move_result(std::vector<uint8_t>&& data) {
+  const auto result = try_write_move(std::move(data));
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
 }
 
-bool UdsClient::async_try_write_copy(memory::ConstByteSpan data) {
-  if (data.empty() || data.size() > base::constants::MAX_BUFFER_SIZE) {
+wrapper::SendResult UdsClient::try_write_move(std::vector<uint8_t>&& data) {
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(*reason);
   }
-  return async_try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
-}
-
-bool UdsClient::async_try_write_move(std::vector<uint8_t>&& data) {
-  if (!impl_->connected_.load() || impl_->stop_requested_.load()) {
-    impl_->stats_.record_failed_send();
-    return false;
-  }
+  if (auto hook = detail::g_uds_write_admission_hook.load()) hook();
   const auto added = data.size();
   if (added == 0 || added > base::constants::MAX_BUFFER_SIZE) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(added == 0 ? wrapper::SendRejection::InvalidArgument
+                                                  : wrapper::SendRejection::TooLarge);
   }
   const auto reject_for_pressure = [this, added]() {
     if (impl_->bp_strategy_ == base::constants::BackpressureStrategy::BestEffort) {
@@ -415,40 +713,62 @@ bool UdsClient::async_try_write_move(std::vector<uint8_t>&& data) {
   if (impl_->backpressure_active_.load() || impl_->queue_bytes_ + added > impl_->bp_high_ ||
       impl_->queue_bytes_ + impl_->pending_bytes_ + added > impl_->bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(impl_->queue_bytes_, impl_->pending_bytes_, impl_->backpressure_active_,
-                                           added, impl_->bp_high_, impl_->bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(impl_->write_reserve_mtx_, impl_->inflight_bytes_, impl_->queue_bytes_,
+                                           impl_->pending_bytes_, impl_->backpressure_active_, added, impl_->bp_high_,
+                                           impl_->bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
 
-  net::post(impl_->strand_, [this, self = shared_from_this(), data = std::move(data), added]() mutable {
-    if (!impl_->connected_.load() || impl_->stop_requested_.load()) {
-      queue_util::release_reserved_write_bytes(impl_->queue_bytes_, added);
-      impl_->stats_.record_failed_send();
-      return;
-    }
+  net::post(impl_->strand_,
+            [self = shared_from_this(), buf = std::move(data), added, seq, connection, request]() mutable {
+              if (seq != self->impl_->current_seq_.load()) return;
+              if (connection != self->impl_->connection_seq_.load()) {
+                self->impl_->stats_.record_dropped(1, added);
+                // The old connection drain already removed this queue reservation.
+                return;
+              }
+              auto impl = self->impl_.get();
+              if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
+                  impl->state_.is_state(LinkState::Error)) {
+                queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
+                impl->stats_.record_failed_send();
+                return;
+              }
 
-    impl_->tx_.emplace_back(std::move(data));
-    impl_->observe_queue();
-    impl_->report_backpressure(self, impl_->queue_bytes_);
-    if (!impl_->writing_) impl_->do_write(self, impl_->current_seq_.load());
-  });
-  return true;
+              impl->tx_.push_back(Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request});
+              impl->observe_queue();
+              impl->report_backpressure(self, impl->queue_bytes_);
+              if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
-bool UdsClient::async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-  if (!impl_->connected_.load() || impl_->stop_requested_.load() || !data || data->empty()) {
+wrapper::SendResult UdsClient::async_try_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) {
+  const auto result = try_write_shared(std::move(data));
+  if (auto hook = detail::g_uds_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult UdsClient::try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (!data || data->empty()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
+  }
+  if (data->size() > base::constants::MAX_BUFFER_SIZE) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
   const auto added = data->size();
-  if (added > base::constants::MAX_BUFFER_SIZE) {
-    impl_->stats_.record_failed_send();
-    return false;
-  }
   const auto reject_for_pressure = [this, added]() {
     if (impl_->bp_strategy_ == base::constants::BackpressureStrategy::BestEffort) {
       impl_->stats_.record_dropped(1, added);
@@ -456,31 +776,49 @@ bool UdsClient::async_try_write_shared(std::shared_ptr<const std::vector<uint8_t
       impl_->stats_.record_failed_send();
     }
   };
+  if (auto reason = impl_->admission_rejection()) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_uds_write_admission_hook.load()) hook();
   if (impl_->backpressure_active_.load() || impl_->queue_bytes_ + added > impl_->bp_high_ ||
       impl_->queue_bytes_ + impl_->pending_bytes_ + added > impl_->bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(impl_->queue_bytes_, impl_->pending_bytes_, impl_->backpressure_active_,
-                                           added, impl_->bp_high_, impl_->bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(impl_->write_reserve_mtx_, impl_->inflight_bytes_, impl_->queue_bytes_,
+                                           impl_->pending_bytes_, impl_->backpressure_active_, added, impl_->bp_high_,
+                                           impl_->bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
 
-  net::post(impl_->strand_, [this, self = shared_from_this(), data = std::move(data), added]() mutable {
-    if (!impl_->connected_.load() || impl_->stop_requested_.load()) {
-      queue_util::release_reserved_write_bytes(impl_->queue_bytes_, added);
-      impl_->stats_.record_failed_send();
-      return;
-    }
+  net::post(impl_->strand_,
+            [self = shared_from_this(), buf = std::move(data), added, seq, connection, request]() mutable {
+              if (seq != self->impl_->current_seq_.load()) return;
+              if (connection != self->impl_->connection_seq_.load()) {
+                self->impl_->stats_.record_dropped(1, added);
+                // The old connection drain already removed this queue reservation.
+                return;
+              }
+              auto impl = self->impl_.get();
+              if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
+                  impl->state_.is_state(LinkState::Error)) {
+                queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
+                impl->stats_.record_failed_send();
+                return;
+              }
 
-    impl_->tx_.emplace_back(std::move(data));
-    impl_->observe_queue();
-    impl_->report_backpressure(self, impl_->queue_bytes_);
-    if (!impl_->writing_) impl_->do_write(self, impl_->current_seq_.load());
-  });
-  return true;
+              impl->tx_.push_back(Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request});
+              impl->observe_queue();
+              impl->report_backpressure(self, impl->queue_bytes_);
+              if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 void UdsClient::on_bytes(OnBytes cb) {
@@ -502,13 +840,16 @@ void UdsClient::on_backpressure(OnBackpressure cb) {
 }
 
 void UdsClient::set_backpressure_strategy(base::constants::BackpressureStrategy strategy) {
+  config::detail::strategy(strategy);
   impl_->bp_strategy_.store(strategy, std::memory_order_relaxed);
 }
 
 void UdsClient::set_retry_interval(unsigned interval_ms) {
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
+  auto candidate = impl_->cfg_;
+  candidate.retry_interval_ms = interval_ms;
+  config::detail::validate(candidate);
   impl_->cfg_.retry_interval_ms = interval_ms;
-  impl_->cfg_.validate_and_clamp();
 }
 
 void UdsClient::set_reconnect_policy(ReconnectPolicy policy) {
@@ -555,7 +896,7 @@ void UdsClient::Impl::do_connect(std::shared_ptr<UdsClient> self, uint64_t seq) 
     connection_timeout_ms = cfg_.connection_timeout_ms;
   }
   connect_timer_.expires_after(std::chrono::milliseconds(connection_timeout_ms));
-  connect_timer_.async_wait(net::bind_executor(strand_, [self, seq](const boost::system::error_code& ec) {
+  connect_timer_.async_wait(track_io(self, [self, seq](const boost::system::error_code& ec) {
     if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) return;
     if (!ec) {
       self->impl_->record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::CONNECTION, "connect",
@@ -565,8 +906,7 @@ void UdsClient::Impl::do_connect(std::shared_ptr<UdsClient> self, uint64_t seq) 
     }
   }));
 
-  socket_->async_connect(*endpoint, net::bind_executor(strand_, [self, seq,
-                                                                 endpoint](const boost::system::error_code& ec) {
+  socket_->async_connect(*endpoint, track_io(self, [self, seq, endpoint](const boost::system::error_code& ec) {
     self->impl_->connect_timer_.cancel();
     if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) return;
     if (self->impl_->stop_requested_.load() || self->impl_->stopping_.load()) {
@@ -581,7 +921,14 @@ void UdsClient::Impl::do_connect(std::shared_ptr<UdsClient> self, uint64_t seq) 
       return;
     }
 
-    self->impl_->connected_ = true;
+    {
+      std::lock_guard<std::mutex> lock(self->impl_->submission_mtx_);
+      if (self->impl_->stop_requested_.load()) return;
+      const auto connection = self->impl_->connection_seq_.fetch_add(1) + 1;
+      self->impl_->write_wait_ = std::make_shared<detail::UdsWriteWait>(connection);
+      self->impl_->connected_ = true;
+    }
+    self->impl_->rx_ = std::make_shared<std::vector<uint8_t>>(self->impl_->cfg_.read_buffer_size);
     self->impl_->reconnect_attempt_count_ = 0;
     self->impl_->retry_attempts_ = 0;
     self->impl_->transition_to(LinkState::Connected);
@@ -592,7 +939,7 @@ void UdsClient::Impl::do_connect(std::shared_ptr<UdsClient> self, uint64_t seq) 
 }
 
 void UdsClient::Impl::schedule_retry(std::shared_ptr<UdsClient> self, uint64_t seq) {
-  transition_to(LinkState::Error);
+  if (stop_requested_.load() || stopping_.load()) return;
 
   // Snapshot once rather than locking repeatedly - cfg_/reconnect_policy_
   // can change concurrently via set_retry_interval() etc. from any user
@@ -610,88 +957,137 @@ void UdsClient::Impl::schedule_retry(std::shared_ptr<UdsClient> self, uint64_t s
   auto decision =
       detail::decide_reconnect_uds(cfg_snapshot, dummy_err, reconnect_attempt_count_, reconnect_policy_snapshot);
 
-  if (!decision.should_retry || stop_requested_.load() || stopping_.load()) {
-    transition_to(LinkState::Idle);
+  if (!decision.should_retry) {
+    transition_to(LinkState::Error);
     return;
   }
 
+  transition_to(LinkState::Connecting);
+  if (stop_requested_.load() || stopping_.load()) return;
   reconnect_attempt_count_++;
   retry_timer_.expires_after(decision.delay.value_or(std::chrono::milliseconds(cfg_snapshot.retry_interval_ms)));
-  retry_timer_.async_wait(net::bind_executor(strand_, [self, seq](const boost::system::error_code& ec) {
+  retry_timer_.async_wait(track_io(self, [self, seq](const boost::system::error_code& ec) {
     if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) return;
     self->impl_->do_connect(self, seq);
   }));
 }
 
 void UdsClient::Impl::start_read(std::shared_ptr<UdsClient> self, uint64_t seq) {
-  if (stop_requested_.load() || stopping_.load() || seq != current_seq_.load()) {
-    return;
-  }
-
-  socket_->async_read_some(net::buffer(rx_.data(), rx_.size()),
-                           net::bind_executor(strand_, [self, seq](const boost::system::error_code& ec, size_t bytes) {
-                             if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) return;
-                             if (self->impl_->stop_requested_.load() || self->impl_->stopping_.load()) return;
-                             if (ec) {
-                               self->impl_->handle_close(self, seq, ec);
-                               return;
-                             }
-
-                             interface::SharedCallback<OnBytes> cb;
-                             {
-                               std::lock_guard<std::mutex> lock(self->impl_->callback_mtx_);
-                               cb = self->impl_->on_bytes_;
-                             }
-                             if (bytes > 0) self->impl_->stats_.record_received(bytes);
-                             if (cb) (*cb)(memory::ConstByteSpan(self->impl_->rx_.data(), bytes));
-                             self->impl_->start_read(self, seq);
-                           }));
-}
-
-void UdsClient::Impl::do_write(std::shared_ptr<UdsClient> self, uint64_t seq) {
-  if (stop_requested_.load() || stopping_.load() || seq != current_seq_.load()) {
-    tx_.clear();
-    pending_.clear();
-    queue_bytes_ = 0;
-    pending_bytes_ = 0;
-    current_write_batch_.clear();
-    writing_ = false;
-    return;
-  }
-
-  if (tx_.empty() || writing_) return;
-  writing_ = true;
-  // Drain several queued buffers into one scatter-gather write rather than one
-  // send syscall per message. `writing_` keeps do_write() from re-entering, so
-  // the batch and its views stay put for the whole operation.
-  const size_t bytes_to_write = queue_util::take_gather_batch(tx_, current_write_batch_, current_write_views_);
-
-  socket_->async_write(
-      current_write_views_,
-      net::bind_executor(strand_, [self, seq, bytes_to_write](const boost::system::error_code& ec, size_t written) {
-        if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) return;
-        if (self->impl_->stop_requested_.load() || self->impl_->stopping_.load()) {
-          self->impl_->current_write_batch_.clear();
-          self->impl_->writing_ = false;
+  if (stop_requested_.load() || seq != current_seq_.load() || !connected_.load()) return;
+  const auto connection = connection_seq_.load();
+  auto buffer = rx_;
+  socket_->async_read_some(
+      net::buffer(*buffer),
+      track_io(self, [self, seq, connection, buffer](const boost::system::error_code& ec, size_t bytes) {
+        auto* impl = self->impl_.get();
+        if (ec == net::error::operation_aborted || seq != impl->current_seq_.load() ||
+            connection != impl->connection_seq_.load() || impl->stop_requested_.load())
           return;
-        }
-        self->impl_->writing_ = false;
-        self->impl_->current_write_batch_.clear();
-        self->impl_->queue_bytes_ =
-            (self->impl_->queue_bytes_ >= bytes_to_write) ? (self->impl_->queue_bytes_ - bytes_to_write) : 0;
-        self->impl_->report_backpressure(self, self->impl_->queue_bytes_);
-
         if (ec) {
-          self->impl_->handle_close(self, seq, ec);
+          impl->handle_close(self, seq, ec);
           return;
         }
-        self->impl_->stats_.record_sent(written);
-        if (!self->impl_->tx_.empty()) self->impl_->do_write(self, seq);
+        interface::SharedCallback<OnBytes> cb;
+        {
+          std::lock_guard<std::mutex> lock(impl->callback_mtx_);
+          cb = impl->on_bytes_;
+        }
+        if (bytes > 0) impl->stats_.record_received(bytes);
+        diagnostics::invoke_callback("uds_client", "on_bytes", cb, memory::ConstByteSpan(buffer->data(), bytes));
+        impl->start_read(self, seq);
       }));
 }
 
-void UdsClient::Impl::handle_close(std::shared_ptr<UdsClient> self, uint64_t seq, const boost::system::error_code&) {
-  connected_ = false;
+void UdsClient::Impl::do_write(std::shared_ptr<UdsClient> self, uint64_t seq) {
+  if (stop_requested_.load() || seq != current_seq_.load() || !connected_.load() || tx_.empty() || writing_) return;
+  // The ledger, not the admission mutex, fences this handoff against stop and
+  // loss: taking the admission mutex here per batch contends with every producer.
+  auto batch = std::make_shared<WriteBatch>();
+  batch->bytes = queue_util::take_gather_batch(tx_, batch->buffers, batch->views, BufferProjection{});
+  if (!send_accounting_.begin_batch(batch->buffers, [](const auto& item) { return item.request; })) {
+    // Stop/loss already terminated these; leave them to its queue cleanup.
+    queue_util::return_gather_batch(tx_, batch->buffers);
+    return;
+  }
+  writing_ = true;
+  active_write_ = batch;
+  const auto connection = connection_seq_.load();
+  auto completion = track_io(self, [self, seq, connection, batch](boost::system::error_code ec, size_t written) {
+    auto* impl = self->impl_.get();
+    bool current_connection;
+    {
+      // A short composed write without an error is still a terminal failure.
+      if (!ec && written < batch->bytes) ec = net::error::connection_reset;
+      // Only a failure must close admission; success needs just the ledger.
+      std::unique_lock<std::mutex> lock(impl->submission_mtx_, std::defer_lock);
+      if (ec) lock.lock();
+      current_connection = connection == impl->connection_seq_.load();
+      impl->send_accounting_.complete_batch(
+          batch->buffers, written, [](const auto& item) { return item.request; },
+          [](const auto& item) {
+            return std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, item.buffer);
+          });
+      if (current_connection && ec) impl->mark_disconnected_locked();
+    }
+    if (!current_connection) {
+      batch->buffers.clear();
+      return;
+    }
+    impl->active_write_.reset();
+    impl->writing_ = false;
+    if (impl->stop_requested_.load() || seq != impl->current_seq_.load()) {
+      batch->buffers.clear();
+      return;
+    }
+    if (ec) {
+      queue_util::return_gather_batch(impl->tx_, batch->buffers);
+      impl->handle_close(self, seq, ec);
+      return;
+    }
+    batch->buffers.clear();
+    queue_util::release_reserved_write_bytes(impl->queue_bytes_, batch->bytes);
+    impl->stats_.record_sent(written);
+    impl->report_backpressure(self, impl->queue_bytes_);
+    impl->do_write(self, seq);
+  });
+  try {
+    socket_->async_write(batch->views, std::move(completion));
+  } catch (...) {
+    mark_disconnected();
+    const auto ec = make_error_code(boost::system::errc::no_buffer_space);
+    handle_close(self, seq, ec);
+  }
+}
+
+void UdsClient::Impl::discard_connection_writes() {
+  size_t messages = tx_.size() + pending_.size();
+  size_t bytes = 0;
+  for (const auto& buffer : tx_)
+    bytes += std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, buffer.buffer);
+  for (const auto& buffer : pending_)
+    bytes += std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, buffer.buffer);
+  if (active_write_) {
+    messages += active_write_->buffers.size();
+    bytes += active_write_->bytes;
+    // Its completion handler retains the buffers; it must not mutate new state.
+    active_write_.reset();
+  }
+  tx_.clear();
+  pending_.clear();
+  queue_bytes_ = 0;
+  pending_bytes_ = 0;
+  writing_ = false;
+  backpressure_active_ = false;
+  if (messages) stats_.record_dropped(messages, bytes);
+}
+
+void UdsClient::Impl::handle_close(std::shared_ptr<UdsClient> self, uint64_t seq, const boost::system::error_code& ec) {
+  if (ec == net::error::operation_aborted || seq != current_seq_.load()) return;
+  if (ec && ec != net::error::timed_out)
+    record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::CONNECTION, "connection", ec,
+                 "Connection closed: " + ec.message(), true, reconnect_attempt_count_);
+  mark_disconnected();
+  discard_connection_writes();
   close_socket();
   retry_timer_.cancel();
   connect_timer_.cancel();
@@ -710,14 +1106,10 @@ void UdsClient::Impl::transition_to(LinkState next, const boost::system::error_c
     std::lock_guard<std::mutex> lock(callback_mtx_);
     cb = on_state_;
   }
-  if (cb) (*cb)(next);
+  diagnostics::invoke_callback("uds_client", "on_state", cb, next);
 }
 
-void UdsClient::Impl::perform_stop_cleanup(uint64_t seq) {
-  if (seq != current_seq_.load()) {
-    return;
-  }
-
+void UdsClient::Impl::perform_stop_cleanup() {
   retry_timer_.cancel();
   connect_timer_.cancel();
   close_socket();
@@ -725,16 +1117,13 @@ void UdsClient::Impl::perform_stop_cleanup(uint64_t seq) {
   queue_bytes_ = 0;
   pending_.clear();
   pending_bytes_ = 0;
-  current_write_batch_.clear();
   writing_ = false;
   connected_.store(false);
   backpressure_active_.store(false);
 
-  if (owns_ioc_ && work_guard_) {
-    work_guard_.reset();
-  }
-
   state_.set(LinkState::Idle);
+  cleanup_finished_ = true;
+  if (pending_io_ == 0) mark_cleanup_done();
 }
 
 void UdsClient::Impl::close_socket() {
@@ -759,16 +1148,24 @@ queue_util::BackpressureFields UdsClient::Impl::bp_fields() {
                                         bp_high_,
                                         bp_low_,
                                         bp_limit_,
-                                        bp_strategy_.load(std::memory_order_relaxed)};
+                                        bp_strategy_.load(std::memory_order_relaxed),
+                                        &write_reserve_mtx_};
 }
 
-void UdsClient::Impl::route_enqueued_buffer(std::shared_ptr<UdsClient> self, BufferVariant&& buf, size_t added) {
+void UdsClient::Impl::route_enqueued_buffer(std::shared_ptr<UdsClient> self, TrackedBuffer&& buf, size_t added) {
+  if (stop_requested_ || stopping_) {
+    queue_util::release_reserved_limit_bytes(write_reserve_mtx_, inflight_bytes_, added);
+    return;
+  }
   auto f = bp_fields();
   queue_util::DropAccounting dropped;
-  auto decision = queue_util::decide_enqueue(f, added, tx_, dropped);
+  auto decision = queue_util::decide_enqueue(
+      f, added, tx_, dropped, BufferProjection{},
+      [this](const TrackedBuffer& item) { send_accounting_.discard(item.request, Ledger::Cause::QueuePressure); });
   if (dropped.any()) stats_.record_dropped(dropped.messages, dropped.bytes);
 
   if (decision == queue_util::EnqueueDecision::Rejected) {
+    send_accounting_.discard(buf.request, Ledger::Cause::QueuePressure);
     WIRESTEAD_LOG_ERROR("uds_client", "write", fmt::format("Queue limit exceeded ({} bytes)", queue_bytes_ + added));
     // #448: record as dropped so it's reflected in RuntimeStats instead of
     // silently vanishing after being counted as accepted.

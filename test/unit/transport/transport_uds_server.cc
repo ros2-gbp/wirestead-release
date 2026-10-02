@@ -17,14 +17,17 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <boost/asio.hpp>
 #include <memory>
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "test/mocks/mock_uds_acceptor.hpp"
 #include "test_constants.hpp"
 #include "test_utils.hpp"
+#include "wirestead/transport/uds/boost_uds_acceptor.hpp"
 #include "wirestead/transport/uds/uds_server.hpp"
 
 using namespace wirestead;
@@ -48,7 +51,7 @@ class TransportUdsServerTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    server->stop();
+    wirestead::test::stop_with_context(server, ioc);
     TestUtils::removeFileIfExists(cfg.socket_path);
     TestUtils::waitFor(constants::kShortTimeout.count());
   }
@@ -132,7 +135,7 @@ TEST_F(TransportUdsServerTest, BindFailure) {
 // Regression test for jwsung91/wirestead#453: a transient accept() failure
 // (e.g. EMFILE) used to be logged and silently swallowed, permanently
 // stopping the server from ever accepting again. It must now surface an
-// Error state transition and keep retrying do_accept().
+// diagnostic record and keep retrying do_accept() without a terminal Error.
 TEST_F(TransportUdsServerTest, AcceptFailureRetriesAndKeepsAccepting) {
   EXPECT_CALL(*mock_acceptor, open(_, _)).WillOnce(Return());
   EXPECT_CALL(*mock_acceptor, bind(_, _)).WillOnce(Return());
@@ -160,11 +163,94 @@ TEST_F(TransportUdsServerTest, AcceptFailureRetriesAndKeepsAccepting) {
 
   server->start();
 
-  for (int i = 0; i < 50 && !(has_error && retried); ++i) {
+  for (int i = 0; i < 50 && !retried; ++i) {
     ioc.poll();
     TestUtils::waitFor(10);
   }
 
-  EXPECT_TRUE(has_error);
+  EXPECT_FALSE(has_error);
+  EXPECT_EQ(server->state(), base::LinkState::Listening);
+  ASSERT_TRUE(server->last_error_info());
+  EXPECT_EQ(server->last_error_info()->operation, "accept");
   EXPECT_TRUE(retried);
 }
+
+class UdsMoveOwnershipTest : public ::testing::TestWithParam<bool> {};
+TEST_P(UdsMoveOwnershipTest, RejectionWithoutTargetsPreservesSource) {
+  config::UdsServerConfig cfg;
+  cfg.socket_path = TestUtils::makeUniqueUdsSocketPath("move-reject").string();
+  boost::asio::io_context io;
+  auto native = UdsServer::create(cfg, std::make_unique<transport::BoostUdsAcceptor>(io), io);
+  auto send = [&](std::vector<uint8_t>& bytes) {
+    return GetParam() ? native->async_try_write_move(std::move(bytes)) : native->async_write_move(std::move(bytes));
+  };
+  std::vector<uint8_t> payload{1, 2, 3};
+  const auto original = payload;
+  EXPECT_FALSE(send(payload));
+  EXPECT_EQ(payload, original);
+  test::stop_with_context(native, io);
+  payload = original;
+  EXPECT_FALSE(send(payload));
+  EXPECT_EQ(payload, original);
+}
+
+#ifndef _WIN32
+TEST_P(UdsMoveOwnershipTest, AllRejectedPreservesAndPartialAcceptanceConsumesSource) {
+  using namespace std::chrono_literals;
+  boost::asio::io_context io;
+  config::UdsServerConfig cfg;
+  cfg.socket_path = TestUtils::makeUniqueUdsSocketPath("move-fanout").string();
+  cfg.backpressure_threshold = 1024;
+  auto native = UdsServer::create(cfg, std::make_unique<transport::BoostUdsAcceptor>(io), io);
+  struct Cleanup {
+    std::shared_ptr<UdsServer> native;
+    boost::asio::io_context& io;
+    std::string path;
+    ~Cleanup() {
+      test::stop_with_context(native, io);
+      TestUtils::removeFileIfExists(path);
+    }
+  } cleanup{native, io, cfg.socket_path};
+  auto pump = [&](auto ready) {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!ready()) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (io.stopped()) io.restart();
+      io.run_one_for(5ms);
+    }
+    return true;
+  };
+  native->start();
+  ASSERT_TRUE(pump([&] { return native->state() == base::LinkState::Listening; }));
+  boost::asio::local::stream_protocol::socket first(io), second(io);
+  first.connect(boost::asio::local::stream_protocol::endpoint(cfg.socket_path));
+  ASSERT_TRUE(pump([&] { return native->client_count() == 1; }));
+  const auto first_id = native->connected_clients().front();
+  second.connect(boost::asio::local::stream_protocol::endpoint(cfg.socket_path));
+  ASSERT_TRUE(pump([&] { return native->client_count() == 2; }));
+  const auto limit = native->write_queue_limit(first_id);
+  ASSERT_TRUE(limit.has_value());
+  // Keep the executor paused. The first target has no capacity; the second
+  // can still accept. The move belongs to the aggregate any-accepted result.
+  ASSERT_TRUE(native->send_to_client(first_id, std::string(*limit, 'p')));
+  auto send = [&](std::vector<uint8_t>& bytes) {
+    return GetParam() ? native->async_try_write_move(std::move(bytes)) : native->async_write_move(std::move(bytes));
+  };
+  std::vector<uint8_t> oversized(*limit + 1, 'x');
+  const auto original = oversized;
+  EXPECT_FALSE(send(oversized));
+  EXPECT_EQ(oversized, original);
+  std::vector<uint8_t> payload{'o', 'k'};
+  ASSERT_TRUE(send(payload));
+  EXPECT_TRUE(payload.empty());
+  payload.assign(2, 'z');  // The admitted data no longer belongs to the caller.
+  ASSERT_TRUE(pump([&] {
+    boost::system::error_code ec;
+    return second.available(ec) >= 2 && !ec;
+  }));
+  std::array<char, 2> received{};
+  boost::asio::read(second, boost::asio::buffer(received));
+  EXPECT_EQ(std::string(received.data(), received.size()), "ok");
+}
+#endif
+INSTANTIATE_TEST_SUITE_P(PlainAndTry, UdsMoveOwnershipTest, ::testing::Bool());

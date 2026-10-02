@@ -21,6 +21,7 @@
 #include <chrono>
 #include <memory>
 
+#include "tcp_stop_with_context.hpp"
 #include "test_utils.hpp"
 #include "wirestead/builder/udp_builder.hpp"
 #include "wirestead/config/udp_config.hpp"
@@ -52,6 +53,7 @@ TEST_F(UdpOptionsTest, SetterCoverage) {
   // It returns ChannelInterface& so we can chain it, but UdpClient wrapper implements it.
   udp.auto_start(true);
   udp.auto_start(false);
+  udp.stop();
 
   // Test manage_external_context
   udp.manage_external_context(true);
@@ -67,6 +69,7 @@ TEST_F(UdpOptionsTest, ConstructorWithExternalContext) {
 
   // Should not throw
   udp.auto_start(false);
+  udp.stop();
 }
 
 TEST_F(UdpOptionsTest, AutoManageStartsInjectedTransport) {
@@ -100,8 +103,8 @@ TEST_F(UdpOptionsTest, AutoManageStartsInjectedTransport) {
 
   EXPECT_TRUE(sender.connected());
 
-  sender.stop();
-  receiver.stop();
+  stop_wrapper_with_context(sender, sender_ioc);
+  stop_wrapper_with_context(receiver, receiver_ioc);
 }
 
 TEST_F(UdpOptionsTest, StartFutureReflectsBindFailure) {

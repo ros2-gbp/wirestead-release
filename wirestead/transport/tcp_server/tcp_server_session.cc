@@ -19,8 +19,10 @@
 #include <cstring>
 #include <iostream>
 
+#include "wirestead/diagnostics/callback.hpp"
 #include "wirestead/memory/memory_pool.hpp"
 #include "wirestead/transport/base/bp_utils.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
 #include "wirestead/transport/tcp_server/boost_tcp_socket.hpp"
 
 namespace wirestead {
@@ -73,42 +75,58 @@ TcpServerSession::TcpServerSession(net::io_context& ioc, std::unique_ptr<interfa
       std::clamp(read_buffer_size, base::constants::MIN_READ_BUFFER_SIZE, base::constants::MAX_READ_BUFFER_SIZE));
 }
 
-void TcpServerSession::start() {
+void TcpServerSession::start() { start_with_notification({}); }
+
+void TcpServerSession::start_with_notification(std::function<void()> notify) {
   if (alive_.exchange(true)) return;
   auto self = shared_from_this();
-  net::dispatch(strand_, [self] {
+  net::post(strand_, [self, notify = std::move(notify)] {
+    if (self->closing_ || !self->alive_) return;
     self->reset_idle_timer();
     // No-op on a plain socket, the TLS handshake on an encrypted one. Reading
     // before it completes would hand the session ciphertext, so the first read
     // waits on it - and a failed handshake closes rather than reads.
-    self->socket_->async_handshake(net::bind_executor(self->strand_, [self](const boost::system::error_code& ec) {
-      if (self->closing_ || !self->alive_) return;
-      if (ec) {
-        WIRESTEAD_LOG_WARNING("tcp_server_session", "handshake", "Handshake failed: " + ec.message());
-        self->do_close();
-        return;
-      }
-      self->reset_idle_timer();
-      self->start_read();
-    }));
+    self->socket_->async_handshake([self](const boost::system::error_code& ec) {
+      // Plain sockets may complete inline. Queue read startup so connection
+      // notification finishes first, just as it does for an async TLS handshake.
+      net::post(self->strand_, [self, ec] {
+        if (self->closing_ || !self->alive_) return;
+        if (ec) {
+          WIRESTEAD_LOG_WARNING("tcp_server_session", "handshake", "Handshake failed: " + ec.message());
+          self->do_close();
+          return;
+        }
+        self->reset_idle_timer();
+        self->start_read();
+      });
+    });
+    diagnostics::invoke_callback("tcp_server_session", "on_connect", notify);
   });
 }
 
 bool TcpServerSession::async_write_copy(memory::ConstByteSpan data) {
+  const auto result = write_copy(data);
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::write_copy(memory::ConstByteSpan data) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  if (auto hook = detail::g_tcp_session_write_admission_hook.load()) hook();
   if (!alive_ || closing_) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
   }  // Don't queue writes if session is not alive
 
   size_t size = data.size();
   if (size == 0) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   if (size > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_server_session", "write", "Write size exceeds maximum allowed");
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
 
   // Use memory pool for better performance (only for reasonable sizes)
@@ -120,19 +138,22 @@ bool TcpServerSession::async_write_copy(memory::ConstByteSpan data) {
       if (!queue_util::try_reserve_limit_bytes(write_reserve_mtx_, queue_bytes_, pending_bytes_, inflight_bytes_, size,
                                                bp_limit_)) {
         stats_.record_failed_send();
-        return false;
+        return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
       }
+      Ledger::Admission admission(send_accounting_, size);
       stats_.record_accepted(size);
-      net::post(strand_, [self = shared_from_this(), buf = std::move(pooled_buffer)]() mutable {
-        const auto added = buf.size();
-        if (!self->alive_ || self->closing_) {  // Double-check in case session was closed
-          queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
-          self->stats_.record_failed_send();
-          return;
-        }
-        self->route_enqueued_buffer(BufferVariant{std::move(buf)}, added);
-      });
-      return true;
+      net::post(strand_,
+                [self = shared_from_this(), buf = std::move(pooled_buffer), request = admission.request()]() mutable {
+                  const auto added = buf.size();
+                  if (!self->alive_ || self->closing_) {  // Double-check in case session was closed
+                    queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
+                    self->stats_.record_failed_send();
+                    return;
+                  }
+                  self->route_enqueued_buffer(TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+                });
+      admission.commit();
+      return wrapper::SendResult::accept();
     }
   }
 
@@ -140,99 +161,144 @@ bool TcpServerSession::async_write_copy(memory::ConstByteSpan data) {
   if (!queue_util::try_reserve_limit_bytes(write_reserve_mtx_, queue_bytes_, pending_bytes_, inflight_bytes_, size,
                                            bp_limit_)) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   std::vector<uint8_t> fallback(data.begin(), data.end());
+  Ledger::Admission admission(send_accounting_, size);
   stats_.record_accepted(size);
 
-  net::post(strand_, [self = shared_from_this(), buf = std::move(fallback), size]() mutable {
-    if (!self->alive_ || self->closing_) {  // Double-check in case session was closed
-      queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, size);
-      self->stats_.record_failed_send();
-      return;
-    }
-    self->route_enqueued_buffer(BufferVariant{std::move(buf)}, size);
-  });
-  return true;
+  net::post(strand_,
+            [self = shared_from_this(), buf = std::move(fallback), size, request = admission.request()]() mutable {
+              if (!self->alive_ || self->closing_) {  // Double-check in case session was closed
+                queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, size);
+                self->stats_.record_failed_send();
+                return;
+              }
+              self->route_enqueued_buffer(TrackedBuffer{BufferVariant{std::move(buf)}, request}, size);
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 bool TcpServerSession::async_write_move(std::vector<uint8_t>&& data) {
+  const auto result = write_move(std::move(data));
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::write_move(std::vector<uint8_t>&& data) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  if (auto hook = detail::g_tcp_session_write_admission_hook.load()) hook();
   if (!alive_ || closing_) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
   }
   const auto added = data.size();
   if (added == 0) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   if (added > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_server_session", "write", "Write size exceeds maximum allowed");
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
   if (!queue_util::try_reserve_limit_bytes(write_reserve_mtx_, queue_bytes_, pending_bytes_, inflight_bytes_, added,
                                            bp_limit_)) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
+  Ledger::Admission admission(send_accounting_, added);
   stats_.record_accepted(added);
-  net::post(strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    if (!self->alive_ || self->closing_) {
-      queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
-      self->stats_.record_failed_send();
-      return;
-    }
-    self->route_enqueued_buffer(BufferVariant{std::move(buf)}, added);
-  });
-  return true;
+  net::post(strand_,
+            [self = shared_from_this(), buf = std::move(data), added, request = admission.request()]() mutable {
+              if (!self->alive_ || self->closing_) {
+                queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
+                self->stats_.record_failed_send();
+                return;
+              }
+              self->route_enqueued_buffer(TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 bool TcpServerSession::async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-  if (!alive_ || closing_ || !data || data->empty()) {
+  const auto result = write_shared(std::move(data));
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  if (auto hook = detail::g_tcp_session_write_admission_hook.load()) hook();
+  if (!alive_ || closing_) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  }
+  if (!data || data->empty()) {
+    stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   const auto added = data->size();
   if (added > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_server_session", "write", "Write size exceeds maximum allowed");
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
   if (!queue_util::try_reserve_limit_bytes(write_reserve_mtx_, queue_bytes_, pending_bytes_, inflight_bytes_, added,
                                            bp_limit_)) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
+  Ledger::Admission admission(send_accounting_, added);
   stats_.record_accepted(added);
-  net::post(strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    if (!self->alive_ || self->closing_) {
-      queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
-      self->stats_.record_failed_send();
-      return;
-    }
-    self->route_enqueued_buffer(BufferVariant{std::move(buf)}, added);
-  });
-  return true;
+  net::post(strand_,
+            [self = shared_from_this(), buf = std::move(data), added, request = admission.request()]() mutable {
+              if (!self->alive_ || self->closing_) {
+                queue_util::release_reserved_limit_bytes(self->write_reserve_mtx_, self->inflight_bytes_, added);
+                self->stats_.record_failed_send();
+                return;
+              }
+              self->route_enqueued_buffer(TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 bool TcpServerSession::async_try_write_copy(memory::ConstByteSpan data) {
+  const auto result = try_write_copy(data);
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::try_write_copy(memory::ConstByteSpan data) {
   if (data.empty() || data.size() > base::constants::MAX_BUFFER_SIZE) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(data.empty() ? wrapper::SendRejection::InvalidArgument
+                                                    : wrapper::SendRejection::TooLarge);
   }
-  return async_try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
+  return try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
 }
 
 bool TcpServerSession::async_try_write_move(std::vector<uint8_t>&& data) {
+  const auto result = try_write_move(std::move(data));
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::try_write_move(std::vector<uint8_t>&& data) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  if (auto hook = detail::g_tcp_session_write_admission_hook.load()) hook();
   if (!alive_ || closing_) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
   }
   const auto added = data.size();
   if (added == 0 || added > base::constants::MAX_BUFFER_SIZE) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(added == 0 ? wrapper::SendRejection::InvalidArgument
+                                                  : wrapper::SendRejection::TooLarge);
   }
   const auto reject_for_pressure = [this, added]() {
     if (bp_strategy_ == base::constants::BackpressureStrategy::BestEffort) {
@@ -244,39 +310,54 @@ bool TcpServerSession::async_try_write_move(std::vector<uint8_t>&& data) {
   if (backpressure_active_.load() || queue_bytes_ + added > bp_high_ ||
       queue_bytes_ + pending_bytes_ + added > bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(queue_bytes_, pending_bytes_, backpressure_active_, added, bp_high_,
-                                           bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(write_reserve_mtx_, inflight_bytes_, queue_bytes_, pending_bytes_,
+                                           backpressure_active_, added, bp_high_, bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
+  Ledger::Admission admission(send_accounting_, added);
   stats_.record_accepted(added);
 
-  net::post(strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    if (!self->alive_ || self->closing_) {
-      queue_util::release_reserved_write_bytes(self->queue_bytes_, added);
-      self->stats_.record_failed_send();
-      return;
-    }
+  net::post(strand_,
+            [self = shared_from_this(), buf = std::move(data), added, request = admission.request()]() mutable {
+              if (!self->alive_ || self->closing_) {
+                queue_util::release_reserved_write_bytes(self->queue_bytes_, added);
+                self->stats_.record_failed_send();
+                return;
+              }
 
-    self->tx_.emplace_back(std::move(buf));
-    self->observe_queue();
-    self->report_backpressure(self->queue_bytes_);
-    if (!self->writing_) self->do_write();
-  });
-  return true;
+              self->tx_.push_back(TrackedBuffer{BufferVariant{std::move(buf)}, request});
+              self->observe_queue();
+              self->report_backpressure(self->queue_bytes_);
+              if (!self->writing_) self->do_write();
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 bool TcpServerSession::async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-  if (!alive_ || closing_ || !data || data->empty()) {
+  const auto result = try_write_shared(std::move(data));
+  if (auto hook = detail::g_tcp_session_write_result_hook.load()) hook(result);
+  return result.accepted();
+}
+
+wrapper::SendResult TcpServerSession::try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  if (auto hook = detail::g_tcp_session_write_admission_hook.load()) hook();
+  if (!alive_ || closing_) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  }
+  if (!data || data->empty()) {
+    stats_.record_failed_send();
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   const auto added = data->size();
   if (added > base::constants::MAX_BUFFER_SIZE) {
     stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
   const auto reject_for_pressure = [this, added]() {
     if (bp_strategy_ == base::constants::BackpressureStrategy::BestEffort) {
@@ -288,28 +369,31 @@ bool TcpServerSession::async_try_write_shared(std::shared_ptr<const std::vector<
   if (backpressure_active_.load() || queue_bytes_ + added > bp_high_ ||
       queue_bytes_ + pending_bytes_ + added > bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(queue_bytes_, pending_bytes_, backpressure_active_, added, bp_high_,
-                                           bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(write_reserve_mtx_, inflight_bytes_, queue_bytes_, pending_bytes_,
+                                           backpressure_active_, added, bp_high_, bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
+  Ledger::Admission admission(send_accounting_, added);
   stats_.record_accepted(added);
 
-  net::post(strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    if (!self->alive_ || self->closing_) {
-      queue_util::release_reserved_write_bytes(self->queue_bytes_, added);
-      self->stats_.record_failed_send();
-      return;
-    }
+  net::post(strand_,
+            [self = shared_from_this(), buf = std::move(data), added, request = admission.request()]() mutable {
+              if (!self->alive_ || self->closing_) {
+                queue_util::release_reserved_write_bytes(self->queue_bytes_, added);
+                self->stats_.record_failed_send();
+                return;
+              }
 
-    self->tx_.emplace_back(std::move(buf));
-    self->observe_queue();
-    self->report_backpressure(self->queue_bytes_);
-    if (!self->writing_) self->do_write();
-  });
-  return true;
+              self->tx_.push_back(TrackedBuffer{BufferVariant{std::move(buf)}, request});
+              self->observe_queue();
+              self->report_backpressure(self->queue_bytes_);
+              if (!self->writing_) self->do_write();
+            });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 void TcpServerSession::on_bytes(OnBytes cb) {
@@ -334,27 +418,57 @@ void TcpServerSession::on_close(OnClose cb) {
   });
 }
 
+std::optional<wrapper::SendResult> TcpServerSession::poll_write_wait() const {
+  std::lock_guard<std::mutex> lock(submission_mtx_);
+  if (wait_ended_by_) return wrapper::SendResult::reject(*wait_ended_by_);
+  if (!alive_ || closing_) return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  if (!backpressure_active_) return wrapper::SendResult::accept();
+  return std::nullopt;
+}
+
+void TcpServerSession::request_stop() {
+  std::lock_guard<std::mutex> lock(submission_mtx_);
+  send_accounting_.end(Ledger::Cause::ExplicitStop);
+  closing_ = true;
+  if (!wait_ended_by_) wait_ended_by_ = wrapper::SendRejection::CancelledWhileWaiting;
+}
+
+void TcpServerSession::cancel_write_wait() {
+  std::lock_guard<std::mutex> lock(submission_mtx_);
+  if (!wait_ended_by_) wait_ended_by_ = wrapper::SendRejection::CancelledWhileWaiting;
+}
+
 bool TcpServerSession::alive() const { return alive_.load(); }
 
 wrapper::RuntimeStats TcpServerSession::stats() const {
-  return stats_.snapshot(queue_bytes_.load(std::memory_order_relaxed), pending_bytes_.load(std::memory_order_relaxed),
-                         backpressure_active_.load(std::memory_order_relaxed));
+  auto snapshot =
+      stats_.snapshot(queue_bytes_.load(std::memory_order_relaxed), pending_bytes_.load(std::memory_order_relaxed),
+                      backpressure_active_.load(std::memory_order_relaxed));
+  snapshot.send_accounting = send_accounting_.snapshot();
+  return snapshot;
 }
 
 void TcpServerSession::reset_stats() {
+  std::lock_guard<std::mutex> lock(submission_mtx_);
+  send_accounting_.reset();
   stats_.reset(queue_bytes_.load(std::memory_order_relaxed) + pending_bytes_.load(std::memory_order_relaxed));
 }
 
-void TcpServerSession::stop() {
-  if (closing_.exchange(true)) return;
+void TcpServerSession::stop() { async_stop({}); }
+
+void TcpServerSession::async_stop(std::function<void()> completion) {
+  std::lock_guard<std::mutex> admission_lock(submission_mtx_);
+  send_accounting_.end(Ledger::Cause::ExplicitStop);
+  closing_.store(true);
+  if (!wait_ended_by_) wait_ended_by_ = wrapper::SendRejection::NotReady;
   auto self = shared_from_this();
-  net::post(strand_, [self] {
-    // Clear callbacks on the strand to block further user callbacks after stop.
+  net::post(strand_, [self, completion = std::move(completion)] {
     self->on_bytes_ = nullptr;
     self->on_bp_ = nullptr;
     self->on_close_ = nullptr;
     self->idle_timer_.cancel();
     self->do_close();
+    if (completion) completion();
   });
 }
 
@@ -373,76 +487,95 @@ void TcpServerSession::cancel() {
 }
 
 void TcpServerSession::start_read() {
+  if (closing_ || !alive_) return;
   auto self = shared_from_this();
-  socket_->async_read_some(
-      net::buffer(rx_.data(), rx_.size()), net::bind_executor(strand_, [self](auto ec, std::size_t n) {
-        if (self->closing_ || !self->alive_) return;
-        if (ec) {
-          self->do_close();
-          return;
-        }
-        self->reset_idle_timer();
-        if (n > 0) self->stats_.record_received(n);
-        if (self->on_bytes_) {
-          try {
-            self->on_bytes_(memory::ConstByteSpan(self->rx_.data(), n));
-          } catch (const std::exception& e) {
-            WIRESTEAD_LOG_ERROR("tcp_server_session", "on_bytes",
-                                "Exception in on_bytes callback: " + std::string(e.what()));
-            self->do_close();
-            return;
-          } catch (...) {
-            WIRESTEAD_LOG_ERROR("tcp_server_session", "on_bytes", "Unknown exception in on_bytes callback");
-            self->do_close();
-            return;
-          }
-        }
-        self->start_read();
-      }));
+  socket_->async_read_some(net::buffer(rx_.data(), rx_.size()),
+                           [self](const boost::system::error_code& ec, std::size_t n) {
+                             net::dispatch(self->strand_, [self, ec, n] {
+                               if (self->closing_ || !self->alive_) return;
+                               if (ec) {
+                                 self->do_close();
+                                 return;
+                               }
+                               self->reset_idle_timer();
+                               if (n > 0) self->stats_.record_received(n);
+                               diagnostics::invoke_callback("tcp_server_session", "on_bytes", self->on_bytes_,
+                                                            memory::ConstByteSpan(self->rx_.data(), n));
+                               self->start_read();
+                             });
+                           });
 }
 
 void TcpServerSession::do_write() {
-  if (tx_.empty()) {
-    writing_ = false;
-    return;
-  }
+  // Serialize the actual handoff with stop, not only the enqueue handler.
+  std::unique_lock<std::mutex> lock(submission_mtx_);
+  if (closing_ || !alive_ || tx_.empty() || writing_) return;
   writing_ = true;
+  const size_t bytes_to_write = queue_util::take_gather_batch(tx_, current_write_batch_, current_write_views_, payload);
+  // Admission still fences stop/loss; amortize the ledger lock over the batch.
+  send_accounting_.begin_batch(current_write_batch_, [](const auto& item) { return item.request; });
   auto self = shared_from_this();
-
-  // Drain several queued buffers into one scatter-gather write rather than one
-  // send syscall per message. The batch and its views stay alive for the whole
-  // operation because `writing_` keeps do_write() from re-entering.
-  queue_util::take_gather_batch(tx_, current_write_batch_, current_write_views_);
-
-  auto on_write = [self](const boost::system::error_code& ec, std::size_t n) {
-    // Release the buffers immediately
-    self->current_write_batch_.clear();
-
-    if (self->closing_ || !self->alive_) return;
-    if (self->queue_bytes_ >= n) {
-      self->queue_bytes_ -= n;
-    } else {
-      self->queue_bytes_ = 0;
-    }
-    self->report_backpressure(self->queue_bytes_);
-
-    if (ec) {
-      self->do_close();
-      return;
-    }
-    self->stats_.record_sent(n);
-    self->reset_idle_timer();
-    self->do_write();
-  };
-
-  socket_->async_write(current_write_views_, net::bind_executor(strand_, on_write));
+  // Initiation may write inline; never hold admission across the syscall.
+  // The batch members are strand-owned and the completion posts back to it.
+  lock.unlock();
+  try {
+    socket_->async_write(current_write_views_, [self, bytes_to_write](const boost::system::error_code& ec, size_t n) {
+      // The interface erases associated executors. Post explicitly, including
+      // for endpoints that complete inline during initiation.
+      net::post(self->strand_, [self, bytes_to_write, ec, n] {
+        const bool failed = ec || n != bytes_to_write;
+        {
+          std::lock_guard<std::mutex> completion_lock(self->submission_mtx_);
+          if (self->closing_ || !self->alive_) {
+            self->current_write_batch_.clear();
+            return;
+          }
+          self->send_accounting_.complete_batch(
+              self->current_write_batch_, std::min(n, bytes_to_write), [](const auto& item) { return item.request; },
+              [](const auto& item) {
+                return std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, item.buffer);
+              });
+          self->current_write_batch_.clear();
+          if (failed) {
+            self->send_accounting_.end(Ledger::Cause::ConnectionLoss);
+            self->closing_ = true;
+            if (!self->wait_ended_by_) self->wait_ended_by_ = wrapper::SendRejection::NotReady;
+          }
+        }
+        if (failed) {
+          self->do_close();
+          return;
+        }
+        queue_util::release_reserved_write_bytes(self->queue_bytes_, bytes_to_write);
+        self->stats_.record_sent(n);
+        // Keep writing_ set while callbacks move pending data or enqueue writes.
+        self->report_backpressure(self->queue_bytes_);
+        self->writing_ = false;
+        if (self->closing_ || !self->alive_) return;
+        self->reset_idle_timer();
+        self->do_write();
+      });
+    });
+  } catch (...) {
+    lock.lock();
+    send_accounting_.end(Ledger::Cause::ConnectionLoss);
+    closing_ = true;
+    if (!wait_ended_by_) wait_ended_by_ = wrapper::SendRejection::NotReady;
+    lock.unlock();
+    do_close();
+  }
 }
 
 void TcpServerSession::do_close() {
   if (cleanup_done_.exchange(true)) return;  // Ensures cleanup runs only once
 
-  alive_.store(false);
-  closing_.store(true);  // Redundant, but ensures consistency
+  {
+    std::lock_guard<std::mutex> lock(submission_mtx_);
+    send_accounting_.end(Ledger::Cause::ConnectionLoss);
+    if (!wait_ended_by_) wait_ended_by_ = wrapper::SendRejection::NotReady;
+    alive_.store(false);
+    closing_.store(true);
+  }
 
   // Safely invoke on_close callback
   auto close_cb = std::move(on_close_);
@@ -487,16 +620,19 @@ void TcpServerSession::do_close() {
 
 queue_util::BackpressureFields TcpServerSession::bp_fields() {
   return queue_util::BackpressureFields{queue_bytes_, pending_bytes_, backpressure_active_, bp_high_,
-                                        bp_low_,      bp_limit_,      bp_strategy_};
+                                        bp_low_,      bp_limit_,      bp_strategy_,         &write_reserve_mtx_};
 }
 
-void TcpServerSession::route_enqueued_buffer(BufferVariant&& buf, size_t added) {
+void TcpServerSession::route_enqueued_buffer(TrackedBuffer&& buf, size_t added) {
   auto f = bp_fields();
   queue_util::DropAccounting dropped;
-  auto decision = queue_util::decide_enqueue(f, added, tx_, dropped);
+  auto decision = queue_util::decide_enqueue(f, added, tx_, dropped, payload, [this](const TrackedBuffer& item) {
+    send_accounting_.discard(item.request, Ledger::Cause::QueuePressure);
+  });
   if (dropped.any()) stats_.record_dropped(dropped.messages, dropped.bytes);
 
   if (decision == queue_util::EnqueueDecision::Rejected) {
+    send_accounting_.discard(buf.request, Ledger::Cause::QueuePressure);
     WIRESTEAD_LOG_ERROR("tcp_server_session", "write", "Queue limit exceeded, dropping message");
     // #448: record as dropped so it's reflected in RuntimeStats instead of
     // silently vanishing after being counted as accepted.
