@@ -6,6 +6,579 @@ This project follows the Keep a Changelog section names where practical. The
 core C++ API is still pre-1.0; see `docs/api_stability.md` for compatibility
 and ABI policy.
 
+## v0.10.0 - 2026-10-02
+
+### Changed
+
+- Amortize Serial and TCP/UDS server-session send-accounting locks over each
+  gather batch, preserving request boundaries, reset epochs and stop/loss causes.
+- Clarify that callback/executor stop is request-only; outside concurrent stop
+  callers wait for completion before destruction, restart or stopped-only settings.
+
+- Reduce TCP/UDS client send-accounting lock acquisitions to once per gather
+  batch at handoff and completion, preserving partial-prefix, reset-epoch and
+  stop/loss accounting.
+
+- Restore send throughput lost since v0.9.6 without changing send or accounting
+  policies. No transport holds its admission lock across a write system call, and
+  TCP/UDS client write handoff and successful completion no longer take it at
+  all: the send-accounting ledger fences handoff against stop and connection
+  loss. The ledger's per-request bookkeeping is O(1) and briefly spins instead of
+  sleeping under contention. Unpressured wrapper sends avoid redundant
+  capacity-wait preparation and channel reference-count updates.
+
+- Index send-accounting entries by request identity in a reusable ring instead
+  of a hashed node map. Steady traffic no longer allocates or hashes per request;
+  accounting semantics are unchanged. Sparse retention bounds metadata when
+  rollback or UDP expiry retires later requests behind an older pending write.
+
+- Cache TCP client write-submission executor properties instead of adapting
+  the strand on every send. Enqueue handlers remain asynchronous, serialized
+  on the same strand and owning the transport.
+
+- Defer TCP/UDS client blocking-send executor checks and owning connection
+  references to the capacity-wait path. Rejection reasons and the connection
+  pinned at entry are unchanged.
+
+- **Breaking behavior:** invalid configuration is rejected before application;
+  native construction no longer silently clamps it. Settings outside the explicit
+  runtime allowlist require completed stop. Native callback exceptions are logged
+  and contained without recursive error events; opt-in Serial/UDP callback stop
+  remains quiet. See docs/configuration_and_callbacks.md.
+
+- **Breaking behavior:** established client loss emits one disconnect even when
+  retry succeeds; start failure or retry exhaustion emits one terminal error.
+  UDP virtual-session idle expiry now uses the concrete on_session_expired
+  callback instead of on_disconnect. See docs/lifecycle_events.md.
+
+- **Breaking behavior:** built-in wrappers enforce configurable aggregate receive
+  storage, framing-buffer and server session limits. TCP/UDS end only the affected
+  connection; Serial follows its reopen policy; UDP drops the new input while
+  preserving prior built-in framing/batch state. Concrete receive_stats exposes
+  cause-separated receive counters without changing RuntimeStats or IFramer.
+  Receive-limit changes require completed stop.
+  See docs/receive_memory_limits.md for defaults, costs and excluded storage.
+
+- **Breaking behavior:** built-in plain native writes preserve accepted work
+  under BestEffort instead of implicitly dropping older queued data. Ordinary
+  BestEffort wrapper sends still reject new requests under pressure. Blocking
+  wrapper sends retry capacity races without a five-attempt limit, with a brief
+  wait between retries; callbacks still never wait. Plain/try reservations and
+  pending transfers share hard-limit accounting. See docs/blocking_queue_policy.md.
+
+- **Breaking ABI:** SendAccounting gains session_expiry, changing RuntimeStats
+  and embedded ledger layouts; rebuild C++ consumers. UDP server client_stats
+  now exposes virtual-session totals. Expiry discards accepted waiting work,
+  lets active datagrams retain their completion outcome, and leaves other peers
+  untouched. Socket totals retain expired/stopped contributors exactly once;
+  reset and wrapper restart isolate statistics epochs. Shared-socket pressure
+  remains shared in peer snapshots. See docs/udp_send_accounting.md.
+
+- **Breaking ABI:** TCP/UDS server sessions now expose logical-request send
+  accounting and change their exported class layouts; rebuild C++ consumers.
+  Server aggregates retain closed and stopping sessions exactly once, including
+  legacy totals previously lost at explicit stop. Reset includes retiring
+  contributors. TCP handshake/read state changes and TCP/UDS write completions
+  explicitly return to the session strand; short writes/initiation exceptions
+  terminate outstanding requests. Queue completion preserves concurrent send
+  reservations. See docs/tcp_send_accounting.md.
+
+- Extend logical-request send accounting to UDP sockets, including explicit
+  destinations, stop, local socket errors, queue pressure and reset epochs.
+  Terminal socket states drain queued requests; write initiation exceptions
+  terminate outstanding work. See docs/udp_send_accounting.md for socket and
+  virtual-session scopes.
+
+- Extend logical-request send accounting to UDS clients and Serial, including
+  partial gather completion, reset epochs, stop/loss and queue-pressure causes.
+  Injected inline write completions are deferred to the strand. Serial write
+  EOF now closes/reopens according to configuration instead of taking the
+  transient read-EOF path and leaving queued writes stranded.
+
+- **Breaking ABI:** RuntimeStats gains optional send_accounting. Rebuild C++
+  consumers. The built-in TCP client reports logical accepted/written/outstanding
+  requests and pre-write discard/active abort totals by stop, connection loss
+  and queue pressure. Unsupported transports return no accounting capability.
+  Existing counters retain their meanings. See docs/tcp_send_accounting.md.
+
+- **Breaking:** ServerInterface and TCP/UDS/UDP server broadcast methods return
+  FanoutResult, reporting selected targets, accepted/rejected counts and every
+  rejection reason. Zero targets are explicit; fanout never waits for capacity.
+  Rebuild consumers and use explicit bool conversion for legacy bool adapters.
+  See docs/server_fanout_results.md.
+
+- **Breaking:** ChannelInterface and TCP/UDS/UDP/Serial client wrappers return
+  SendResult from all ten send methods. Contextual bool checks still work;
+  bool assignments/adapters must use accepted(). Rebuild all consumers.
+- **Breaking:** Injected client channels must be the corresponding native
+  transport or implement ConnectionChannel. Unsupported/null channels throw
+  invalid_argument before callback or lifecycle effects; bool-only refusal
+  reasons are never guessed. Wrappers require start() even for connected
+  injected channels. See docs/client_send_results.md.
+
+- **Breaking:** ServerInterface and TCP/UDS/UDP wrappers return SendResult from
+  their five targeted send methods. Contextual bool checks still work; implicit
+  bool assignments require accepted() or an explicit conversion. Rebuild all
+  consumers and update custom ServerInterface overrides. Broadcast remains bool.
+
+- **Breaking ABI/behavior:** TCP/UDS server session wait state changes their
+  layout; rebuild consumers. Reliable/explicit blocking wrappers validate
+  before native accounting and reject old sends across wrapper restart or
+  target replacement instead of retrying terminal failures.
+
+- **Breaking ABI/behavior:** TCP/UDS server sessions gain admission mutexes;
+  rebuild consumers for the changed session layouts. Nonblocking server
+  wrappers require start and validate before native accounting. Session
+  stop/close is ordered with admission, and UDS ordinary writes explicitly
+  reject payloads above MAX_BUFFER_SIZE.
+
+- **Breaking:** Serial writes require an opened and configured device. Device
+  loss discards old queued/posted data instead of replaying it after reopen.
+  Wrappers require start even with an injected connected native port, and early
+  invalid wrapper sends bypass native accounting. Old I/O completions retain
+  their buffers without changing replacement-device state.
+
+- **Breaking:** Native UDP writes require an opened socket, and default-target
+  writes also require a configured/learned peer. Built-in wrappers require their
+  own start and validate payloads before native counters/diagnostics or waiting.
+  See [UDP send results](docs/udp_send_results.md).
+
+
+- **Breaking:** UDS client loss now discards old queued/posted writes instead of
+  replaying them after reconnect. Old completions retain their own buffers and
+  cannot alter new connection state. Built-in UDS wrapper sends require wrapper
+  start and reject invalid payloads before waiting or native accounting.
+  See [UDS send results](docs/uds_send_results.md).
+
+
+- **Breaking behavior:** TCP Reliable and explicit blocking sends now reject invalid payloads before
+  native handoff, matching nonblocking sends; these early rejections do not
+  increment native failure/drop counters. Custom Channel delegation is unchanged.
+
+- **Breaking behavior:** Built-in TCP wrapper nonblocking sends validate before native handoff, so
+  invalid payloads do not increment native transport failure/drop counters.
+  An independently connected injected TCP transport also requires wrapper
+  start before these sends can accept data.
+
+- **Breaking behavior:** TCP reconnect no longer replays data accepted on the
+  previous connection. Posted writes, queued/pending buffers and unfinished
+  write batches are discarded and counted as dropped. Late completions retain
+  their own buffers and cannot alter the replacement connection.
+
+- **Breaking behavior:** TCP client writes now reject before a usable connection
+  exists, including before start, while connecting/TLS handshaking and after
+  connection loss. Readiness publication shares the write-admission mutex.
+  Callers that previously queued data offline must wait for connection readiness.
+
+- **Breaking ABI:** Channel gains a default virtual write_queue_limit() query, and
+  concrete transports report their admission limit. Custom Channel subclasses
+  remain source-compatible, but libraries and consumers must be rebuilt.
+
+- **Breaking behavior:** Blocking-capable sends never wait for capacity inside
+  any wrapper user callback, including connect, disconnect, error,
+  backpressure and timer-delivered batches. They return false under pressure;
+  with capacity available, normal acceptance still applies, including sends
+  to another channel. Outside-callback waiting and try-send behavior are
+  unchanged.
+
+- **Breaking behavior:** TCP client and server outside `stop()` callers,
+  including concurrent callers, wait for transport cleanup and for running
+  callbacks to finish. Server completion includes each live session's cleanup.
+  A call on the target executor requests shutdown and returns without waiting;
+  a call from an independent executor still waits. External executors must
+  keep running during that wait.
+- TCP restart opens a new callback generation atomically. Delayed callbacks,
+  accepts and retries from the previous run cannot enter the restarted run.
+  The stopping thread does not poll a shared executor or use a timeout as
+  evidence that cleanup is safe.
+- D-1 also applies to UDS, UDP client/server and serial in the follow-ups
+  below. D-2 follows in this release; structured send results (D-3) remain
+  separate work.
+- **Breaking behavior:** UDP client/server outside `stop()` callers now wait for
+  every admitted callback and transport cleanup, including cancelled I/O.
+  Calls on the target executor request shutdown and return; external contexts
+  must continue running until outside stop completes. Before-start writes
+  reject without retaining work; restart discards a learned peer while keeping
+  the configured destination.
+
+- **Breaking behavior:** Serial outside stop callers, including concurrent
+  callers and callers on unrelated executors, now wait for transport cleanup
+  and admitted callbacks on owned, external and shared contexts. Calls on the
+  target executor request shutdown and return; external contexts must keep
+  running while outside callers wait. Before-start writes reject without
+  retaining executor work.
+- Serial tracks cancellation through read/write, retry and receive-idle timer
+  completion, retains active gather-write buffers until release, and refuses
+  previous-run wrapper callbacks and batches after restart. Injected channels
+  retain their identity and regain handlers on restart.
+
+- The minimum supported spdlog version is now **1.8**, down from 1.9.
+
+  1.9 was never an API floor. It is where `spdlog::sinks::callback_sink`
+  arrived, which is the likely origin of the number, but this library derives
+  its own callback sink from `spdlog::sinks::base_sink` and has done since that
+  code was written. Every other spdlog name it uses predates 1.1.
+
+  Nothing under `wirestead/` compiles conditionally on `SPDLOG_VERSION`, so an
+  older spdlog cannot quietly remove a feature and leave a passing build behind.
+  `.github/workflows/spdlog-floor.yml` builds and runs the unit suite against
+  1.8.2 on Ubuntu 22.04 amd64 and arm64 and on CentOS Stream 9, and is the thing
+  that keeps the floor true from here.
+
+  Lowering a floor cannot break an existing consumer - anyone who satisfied 1.9
+  satisfies 1.8. What it opens is platforms whose vendored spdlog sits below
+  1.9, which includes RPM-based embedded targets.
+
+### Added
+
+- Custom ConnectionChannel implementations can provide connection-pinned
+  Reliable sends to all four client wrappers. Waits preserve the first
+  stop/loss cause across reconnect, final admission cannot retarget a new
+  connection, and only WouldBlock is retried. Legacy injected Channels and
+  public bool client methods retain their existing compatibility boundary.
+
+- ResultChannel exposes six structured single-target write admission methods,
+  implemented by TCP/UDS clients, UDP and serial. Final legacy bool adapters
+  delegate exactly once. Custom bool-only channels and server fanout remain
+  unchanged; client wrapper result migration remains pending. Native class ABI
+  changes require rebuilding consumers.
+
+- TCP/UDS server Reliable and explicit blocking sends retain one internal
+  SendResult across validation, per-session capacity waiting and pinned final
+  admission. Waits preserve the first stop/loss cause across later changes;
+  only transient native WouldBlock is retried. Public methods remain bool.
+
+- TCP/UDS server sessions and targeted sends retain internal SendResult
+  decisions. Nonblocking wrapper sends combine validation, lifecycle and
+  native admission; explicit try keeps WouldBlock and BestEffort maps it to
+  QueueFull. Public return types remain bool.
+
+- Serial native and wrapper sends retain internal SendResult decisions across
+  validation, readiness, capacity waiting and pinned device admission. Waits
+  preserve the first stop/loss cause. Public methods still return bool.
+
+- UDP client and server targeted sends combine internal SendResult decisions
+  across validation, readiness, capacity waiting and final admission. Native
+  run/session pins and first terminal causes survive stop, error and restart.
+  Public methods still return bool.
+
+
+- Built-in UDS client admission and wrapper sends retain internal SendResult
+  decisions across validation, lifecycle, capacity waits and final submission.
+  Waits preserve the first stop/loss reason and pin the original connection.
+  Public send methods still return bool.
+
+
+- Built-in TCP Reliable and explicit blocking sends now retain one internal
+  SendResult across validation, capacity waiting and pinned native admission.
+  Wait cancellation/loss reasons survive later state changes, and only native
+  capacity refusals are retried. Public sends still return bool.
+
+- Built-in TCP wrapper nonblocking sends combine payload validation, wrapper
+  lifecycle and native admission into an internal SendResult. Explicit try sends
+  report WouldBlock for capacity refusal; ordinary BestEffort sends report
+  QueueFull. Public methods still return bool during D-3 migration.
+
+- Internal TCP admission results distinguish a never-started or fully stopped
+  transport (NotStarted), requested but incomplete cleanup (Stopping), and an
+  active run without a usable connection (NotReady). Public sends remain bool.
+
+- TCP client native admission now retains an internal SendResult for copy,
+  move and shared writes, including try variants. Readiness, payload and capacity
+  rejections are preserved at their original decision point; public APIs still
+  return bool while D-3 wrapper result mapping continues.
+
+- Built-in TCP capacity waits retain their first stop/loss reason in an
+  internal SendResult: CancelledWhileWaiting for stop, NotReady for connection
+  loss. A selected capacity-release result also remains fixed. Public send
+  methods still return bool while the D-3 migration continues.
+
+- Shared wrapper payload-size validation now produces SendResult internally:
+  InvalidArgument for empty input and TooLarge for message/queue size limits.
+  Public sends still return bool; transport rejection and accounting remain
+  unchanged while D-3 migration continues.
+
+- SendResult and SendRejection provide the D-3 acceptance-result value type:
+  explicit accept/reject factories, accepted(), an explicit bool conversion,
+  and a reason() accessor for rejected values. Existing send APIs still return
+  bool; this is the result-type foundation, not the transport migration.
+
+### Fixed
+
+- Blocking-capable sends from ordinary tasks on the target I/O context return
+  WouldBlock instead of waiting or retrying; independent executor callers retain
+  their capacity waits.
+- Server batch queues and timers are per session. TCP/UDS timer and disconnect
+  callbacks now share the session strand; partial batches flush before session
+  end, and callback-initiated stop suppresses subsequent message callbacks.
+  Batch count thresholds no longer combine traffic from different clients.
+
+- Run TCP/UDS server connection callbacks on the session strand before receive
+  and backpressure callbacks. Immediate peer data waits for wrapper framer
+  initialization; stop from connection notification suppresses further receive.
+  Different sessions' connection callbacks may overlap with multiple I/O runners.
+
+- Serialize UDP batch and session-expiry timers with native socket callbacks.
+  UdpChannel::get_executor now returns the socket strand; posted work and timers
+  wait for an active callback instead of overlapping it on another I/O runner.
+
+
+- Preserve the caller's vector when native UDS server move fanout rejects
+  every target, including no-target and oversized requests. Partial acceptance
+  still consumes it. Plain and try move adapters share the ownership rule.
+- Refresh the seven-target v0.10 policy audit and record remaining accounting,
+  queue, callback and event gaps; full draft conformance is not established.
+
+- TCP and UDS server statistics snapshot retained totals and live sessions under
+  the same lock, preventing transient counter loss during session retirement.
+
+- Blocking/Reliable sends using the built-in TCP client now pin the connection
+  across capacity waits and retries. A reconnect ends the old wait, and the
+  expected connection is checked under the transport admission mutex so a
+  replacement connection cannot accept the old payload.
+
+- TCP blocking/Reliable sends now pin their wrapper run across capacity waits
+  and retries. A stop followed by restart cannot resume an old send in the new
+  run, even if the replacement run is also under backpressure.
+
+- TCP client write admission now serializes state checks, queue reservation and
+  strand submission with explicit stop requests. A checked write cannot be
+  admitted after stop cleanup. Executor-origin writes now post their routing
+  work so callbacks can request stop without reentering the admission mutex.
+
+- UDP server Reliable sends and explicit blocking sends use ordinary write
+  admission after waiting, accepting payloads above the pressure watermark
+  when they fit the hard queue limit. Explicit try-send and BestEffort sends
+  retain their nonblocking watermark limit.
+
+- Blocking-capable sends on all seven wrappers bypass capacity waits when a
+  payload exceeds the transport's reported whole-queue hard limit. Existing
+  transport rejection and accounting are retained.
+
+- TCP blocking sends now check connection readiness before waiting and before
+  submitting a copied payload. A disconnected channel with stale pressure no
+  longer holds the caller until that pressure clears.
+- UDP server blocking sends to an unknown client ID no longer wait for the
+  shared channel's queue pressure to clear.
+
+- Reliable and explicit blocking sends no longer wait for queue capacity
+  before rejecting an empty payload or a payload above MAX_BUFFER_SIZE.
+  This applies to all seven wrappers, including newline-appending calls.
+  Transport rejection, error callbacks and failure accounting remain in
+  place; valid payloads retain their existing waiting behavior.
+
+- UDS server session backpressure transitions now reach the registered server
+  callback. Handler snapshots allow replacement after connection and callbacks
+  run outside the session-map mutex.
+
+- UDP restart refuses old callback and timer generations, including batch
+  delivery and server peer expiry. Injected transports retain their identity
+  and regain callbacks on restart. Pending writes and pooled buffers finish
+  cleanup before a new run; oversized-write error callbacks are dispatched
+  on the transport strand so they can safely request stop.
+
+- UDS client/server outside `stop()` callers now wait for transport cleanup
+  and admitted callbacks; target-executor calls request shutdown without
+  blocking. Restart rejects previous-run callbacks, client cancellation retains
+  active I/O storage, and server cleanup waits for every session strand.
+  Never-started and failed-start servers stop without requiring an executor;
+  socket-path ownership protections remain in place.
+
+- `stop()` called from inside a serial callback threw instead of stopping.
+
+  The callback runs on the transport's own io thread, and `stop()` joined that
+  thread unconditionally, so the call joined the thread with itself:
+  `std::system_error`, "Resource deadlock avoided". Without a catch at the call
+  site the library's callback dispatch swallowed and logged it, which hid the
+  real damage - the throw unwound before `io_context::restart()` and before the
+  wrapper released the channel, so the object was left half-stopped. A later
+  `stop()` returned, but a restart's future never completed.
+
+  A `stop()` from the io thread now requests the shutdown and returns without
+  joining, and a later `stop()` from outside completes it, waiting even when a
+  shutdown was already requested. After that call returns the object can be
+  restarted and destroyed. Restarting from inside a callback, before the
+  shutdown completes, remains unsupported.
+
+  Reproduced in `test/repro/serial_stop_in_callback_repro.cc`; covered by
+  `SerialStopInCallbackTest`, which checks that the callback's `stop()` does
+  not throw and that a restarted channel receives data again.
+
+- The CPack Debian package named the wrong Boost package.
+
+  It required only `libboost-system-dev`. The package ships the headers as well
+  as the shared library, and those headers reach `boost/asio`, so it also needs
+  `libboost-dev`. `libboost-system-dev` stays, because `wiresteadConfig.cmake`
+  calls `find_dependency(Boost COMPONENTS system)` and that needs the
+  component's CMake files. These are the same two keys `package.xml` has
+  declared since v0.9.6; the CPack side was missed then because only the ROS
+  packaging was in view.
+
+  A CPack package has never been published, so nothing installed is affected.
+
+### Removed
+
+- **Breaking:** the Unilink compatibility layer, promised for the v0.9.x line
+  only. This is why the next release is v0.10.0 rather than a v0.9 patch.
+
+  Gone: `namespace unilink`, the `<unilink/...>` forwarding headers,
+  `find_package(unilink)` with its `unilink::unilink`, `unilink_shared` and
+  `unilink_static` targets, `unilink.pc`, the `UNILINK_API` / `UNILINK_EXPORT` /
+  `UNILINK_LOG_*` macros, `UnilinkException`, and the `UNILINK_*` CMake option
+  and `UNILINK_LOG_LEVEL` fallbacks. The first group fails loudly at configure or
+  compile time. The last two do not: an old `-DUNILINK_BUILD_TESTS=ON` draws
+  only CMake's unused-variable warning, and `UNILINK_LOG_LEVEL=debug` is
+  ignored outright.
+
+  Migrate on v0.9.x first, where both names build; see
+  `docs/migration-from-unilink.md`. For packagers, the install tree no longer
+  contains `include/unilink/`, `lib/cmake/unilink/` or `unilink.pc`, so the
+  vcpkg port's `vcpkg_cmake_config_fixup(PACKAGE_NAME unilink)` must go with
+  this release or the port build fails.
+
+- `wirestead/memory/memory_validator.hpp`, in full.
+
+  The header declared eleven free functions in `memory::memory_validator`, the
+  `MemoryValidator` RAII class and the three `MemoryPatternGenerator` statics.
+  **None of them had a definition anywhere** - there is no `memory_validator.cc`
+  and never was - so `nm` finds no matching symbol in any library this project
+  has ever built, shared or static. Nothing included the header either, not even
+  `wirestead.hpp`, yet it was listed in `WiresteadSources.cmake` and so installed
+  into the consumer's include directory.
+
+  Nothing can break, because nothing could ever have linked against it. Most of
+  the API was also unimplementable as declared: `memory_accessible()` cannot be
+  answered portably for an arbitrary pointer, and `double_free()` /
+  `use_after_free()` take a raw pointer with no allocator context. The parts that
+  were implementable already exist as `base::safe_memory::safe_memcpy` and are
+  used by five transports, and the real checking is done by the ASan/UBSan
+  Memory Safety Tests job.
+
+- `ThreadSafeState`, `ThreadSafeCounter`, `ThreadSafeFlag` and the
+  `ThreadSafeLinkState` alias, from `wirestead/concurrency/thread_safe_state.hpp`.
+
+  **This is a breaking change.** These are templates and inline functions, so an
+  external consumer could have been using them successfully; nothing inside this
+  project was. There were no instantiations in the library, the tests, or any of
+  the six satellite repositories.
+
+  `AtomicState` and its `AtomicLinkState` alias stay, and the header stays with
+  them: that alias is the state primitive every transport actually uses. It is
+  what made the three removed classes look load-bearing from a distance and they
+  are not - `ThreadSafeState` was only ever reachable through
+  `ThreadSafeLinkState`, which nothing named.
+
+  Adopting rather than deleting was considered and rejected.
+  `ThreadSafeState::notify_callbacks()` took a mutex on every state transition to
+  iterate a callback list nothing ever registered into, so converting the
+  transports to it would have added a lock per connection state change and bought
+  nothing over the `AtomicLinkState` they already use. Removing the three also
+  drops `<shared_mutex>`, `<condition_variable>`, `<functional>`, `<vector>`,
+  `<mutex>`, `<algorithm>` and `<chrono>` from a header six transports include.
+
+  `wirestead-docs` documents all four types. Those sections describe v0.9.6
+  correctly and must be corrected when this change ships: the `ThreadSafeState`,
+  `ThreadSafeCounter` and `ThreadSafeFlag` sections of
+  `docs/contributor/architecture/memory_safety.md` go, the `AtomicState` section
+  stays, and the thread-safety row of its safety-feature table needs rewording.
+
+- `ErrorStats::successful_retries` and `ErrorStats::failed_retries`.
+
+  Both were declared and cleared in `reset()`, and neither was ever incremented
+  or read. `retryable_errors` beside them is incremented and stays. Because
+  `ErrorHandler::error_stats()` is public, a caller reading these two always got
+  0 - not an absent statistic but a silently wrong one.
+
+  Populating them is not a small wiring job: `ErrorHandler` only ever sees
+  errors that were reported to it, and a retry that succeeds reports nothing, so
+  the success count can never reach it without new plumbing from the reconnect
+  path. `RuntimeStats`, where transport telemetry belongs, has no retry counters
+  either. Retry telemetry is a feature to design there, not two fields pinned at
+  zero here.
+
+- Public API that nothing called, anywhere in this project, its tests, its six
+  satellite repositories or its documentation:
+
+  - `GlobalMemoryPool::create_optimized()` and `create_size_optimized()`. The
+    per-channel pool path they were meant to serve is used - `serial.cc`
+    constructs `MemoryPool pool_{0, 200}` directly - so the factories were a
+    redundant second entrance with numbers nobody chose.
+  - `PlatformInfo::get_feature_level()` and `get_platform_description()`. The
+    other five members of that class stay.
+  - `ConfigFactory::create_from_file()` and `get_singleton()`, with the
+    singleton storage and mutex they were the only users of.
+  - Thirteen `InputValidator::validate_*` overloads: the throwing wrappers for
+    host, IPv4, IPv6, UDS path, device path, baud rate, data bits, stop bits,
+    parity, buffer size, memory alignment, timeout and retry interval. No
+    production code called any of them; only their own unit tests did, which is
+    the test existing because the API does rather than a use of it. The six
+    `validate_*` that builders actually throw from stay, as do all six
+    `is_valid_*` predicates the configs call.
+
+    The tests were not deleted with them. Those parameterized tables were the
+    only coverage the `is_valid_*` predicates had, reaching them through the
+    wrappers, so they now drive the predicates directly and the tables are
+    unchanged. `MAX_DEVICE_PATH_LENGTH` went too - `validate_device_path` was
+    its only reader.
+
+- Fifteen constants in `base/constants.hpp` that nothing referenced, including
+  `constants.hpp` itself: the whole thread-pool group (there is no thread pool),
+  the memory-pool sizing group (`MemoryPool`'s constructor uses its own
+  defaults), the cleanup and health-check intervals, the error-recency pair -
+  duplicated by the private `ErrorHandler::MAX_RECENT_ERRORS` that is actually
+  used - plus `DEFAULT_BUFFER_SIZE`.
+
+- `AsyncLogConfig::batch_size` and `AsyncLogConfig::enable_batch_processing`,
+  and the three-argument `AsyncLogConfig` constructor that took a batch size.
+
+  Neither field was ever read. Setting `batch_size` did nothing and said
+  nothing, which is worse than not offering it, and the field sat in the middle
+  of a public constructor's parameter list where a caller had to pass something
+  for it. `enable_batch_processing` was referenced nowhere at all. spdlog
+  manages its own batching behind the async logger, so there was never anything
+  for either to control.
+
+  The constructor had no callers anywhere in the repository. Anyone who used it
+  can construct the struct and assign the two fields that remain.
+
+- The CPack RPM generator.
+
+  `packaging/wirestead.spec` is the supported RPM path as of that file landing.
+  It splits runtime from `-devel` the way an RPM distribution expects, and it is
+  built by the distribution's own toolchain. A CPack RPM is a single combined
+  package built by whatever host runs `cpack`, so one produced on Ubuntu carries
+  Ubuntu's glibc dependencies and will not install on an RPM distribution.
+
+  Nothing ran it: `release.yml` passes `TGZ` on every Linux row, so the RPM
+  settings had never executed, which is how they came to require `boost-system`
+  - a package with no headers - without anyone noticing. Two RPM paths that
+  disagree is the condition that let that survive.
+
+### Compatibility
+
+- **This is a breaking release; rebuild everything that links Wirestead.**
+  The ABI changed (`RuntimeStats`, `Channel`, server session layouts), and
+  send/broadcast methods return `SendResult`/`FanoutResult` instead of `bool`.
+  Each entry above marked **Breaking** says what moved; the migration notes
+  are in `docs/client_send_results.md`, `docs/channel_write_results.md`,
+  `docs/lifecycle_events.md` and `docs/migration-from-unilink.md`.
+- Invalid settings now throw instead of being clamped, and Serial device names
+  are validated at construction. Code that relied on clamping fails at the
+  setter, not at `start()`.
+- The Unilink compatibility layer is gone. Migrate on v0.9.x first, where both
+  names build.
+- The v0.10 communication contract (`docs/communication_contract_v0.10.md`)
+  ships as **Draft**. The behavior listed above is implemented and tested; the
+  draft's Proposed and Open rules are not guarantees of this release. See
+  `docs/communication_contract_v0.10_status.md` for what is verified.
+
+### Known limitations
+
+- Send throughput is back to 80% or more of v0.9.6 in every Orin sweep cell
+  (#702, #703), but UDS Reliable p99 latency is not: 4 KiB is 121% of v0.9.6
+  and 1 KiB 120.5%, against a 120% target. TCP and UDP meet it.
+
+
 ## v0.9.6 - 2026-08-30
 
 ### Added
@@ -44,11 +617,17 @@ and ABI policy.
 
 - `package.xml` is now installed to `share/wirestead/`.
 
-  A `cmake` build-type package is discovered through that file, so without it
-  `ros2 pkg list` and the ament index did not see Wirestead once it was
-  installed from a Debian. Nothing else changes: the library, headers and
-  `wiresteadConfig.cmake` were always installed, and `find_package(wirestead)`
-  behaved correctly the whole time.
+  Without it the Debian carried no package manifest at all - no machine-readable
+  license, maintainer or dependency metadata at the path the ROS ecosystem looks
+  for it. Nothing else changes: the library, headers and `wiresteadConfig.cmake`
+  were always installed, and `find_package(wirestead)` behaved correctly the
+  whole time.
+
+  This matches what released `build_type: cmake` packages do; every one of the
+  eight in Jazzy ships `share/<pkg>/package.xml`. It does **not** make the
+  package visible to `ros2 pkg list` or `ros2 pkg prefix`, which read an ament
+  index marker that plain CMake packages generally do not install -
+  `foonathan_memory_vendor` behaves the same way.
 
 - Boost is declared as a build-time dependency only, and narrowed to the parts
   actually used.

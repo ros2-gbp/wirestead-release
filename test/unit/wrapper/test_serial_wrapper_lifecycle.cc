@@ -26,7 +26,9 @@
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "test/utils/test_utils.hpp"
+#include "test_connection_channel.hpp"
 #include "wirestead/config/serial_config.hpp"
 #include "wirestead/framer/line_framer.hpp"
 #include "wirestead/interface/channel.hpp"
@@ -97,11 +99,14 @@ class FakeSerialPort : public interface::SerialPortInterface {
   std::function<void(const boost::system::error_code&, std::size_t)> read_handler_;
 };
 
-class ControlledChannel : public interface::Channel {
+class ControlledChannel : public wirestead::test::TestConnectionChannel {
  public:
   void start() override { emit_state(base::LinkState::Connected); }
 
-  void stop() override { connected_ = false; }
+  void stop() override {
+    connected_ = false;
+    connection_lost();
+  }
 
   bool is_connected() const override { return connected_; }
 
@@ -109,28 +114,30 @@ class ControlledChannel : public interface::Channel {
 
   boost::asio::any_io_executor get_executor() override { return ioc_.get_executor(); }
 
-  bool async_write_copy(memory::ConstByteSpan data) override {
+  SendResult async_write_copy_result(memory::ConstByteSpan data) override {
     std::lock_guard<std::mutex> lock(mutex_);
     ++write_count_;
     last_write_.assign(reinterpret_cast<const char*>(data.data()), data.size());
     return write_result_;
   }
 
-  bool async_write_move(std::vector<uint8_t>&& data) override {
-    return async_write_copy(memory::ConstByteSpan(data.data(), data.size()));
+  SendResult async_write_move_result(std::vector<uint8_t>&& data) override {
+    return async_write_copy_result(memory::ConstByteSpan(data.data(), data.size()));
   }
 
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override {
-    if (!data) return false;
-    return async_write_copy(memory::ConstByteSpan(data->data(), data->size()));
+  SendResult async_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) override {
+    if (!data) return SendResult::reject(SendRejection::InvalidArgument);
+    return async_write_copy_result(memory::ConstByteSpan(data->data(), data->size()));
   }
 
-  bool async_try_write_copy(memory::ConstByteSpan data) override { return async_write_copy(data); }
+  SendResult async_try_write_copy_result(memory::ConstByteSpan data) override { return async_write_copy_result(data); }
 
-  bool async_try_write_move(std::vector<uint8_t>&& data) override { return async_write_move(std::move(data)); }
+  SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override {
+    return async_write_move_result(std::move(data));
+  }
 
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override {
-    return async_write_shared(std::move(data));
+  SendResult async_try_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) override {
+    return async_write_shared_result(std::move(data));
   }
 
   void on_bytes(OnBytes cb) override { on_bytes_ = std::move(cb); }
@@ -147,8 +154,10 @@ class ControlledChannel : public interface::Channel {
   void emit_state(base::LinkState state) {
     if (state == base::LinkState::Connected) {
       connected_ = true;
+      connection_opened();
     } else if (state == base::LinkState::Closed || state == base::LinkState::Error || state == base::LinkState::Idle) {
       connected_ = false;
+      connection_lost();
     }
 
     if (on_state_) on_state_(state);
@@ -160,7 +169,9 @@ class ControlledChannel : public interface::Channel {
 
   void set_backpressure_active(bool active) { backpressure_active_ = active; }
 
-  void set_write_result(bool result) { write_result_ = result; }
+  void set_write_result(bool result) {
+    write_result_ = result ? SendResult::accept() : SendResult::reject(SendRejection::WouldBlock);
+  }
 
   int write_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -176,7 +187,7 @@ class ControlledChannel : public interface::Channel {
   boost::asio::io_context ioc_;
   bool connected_{false};
   bool backpressure_active_{false};
-  bool write_result_{true};
+  SendResult write_result_{SendResult::accept()};
   mutable std::mutex mutex_;
   int write_count_{0};
   std::string last_write_;
@@ -312,7 +323,7 @@ TEST_F(SerialWrapperLifecycleTest, AutoManageStartsInjectedTransport) {
   boost::asio::io_context ioc;
 
   config::SerialConfig cfg;
-  cfg.device = "fake";
+  cfg.device = "/dev/ttyTEST";
   cfg.baud_rate = 9600;
   cfg.reopen_on_error = false;
 
@@ -324,7 +335,7 @@ TEST_F(SerialWrapperLifecycleTest, AutoManageStartsInjectedTransport) {
 
   EXPECT_TRUE(serial.connected());
 
-  serial.stop();
+  wirestead::test::stop_wrapper_with_context(serial, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
@@ -333,7 +344,7 @@ TEST_F(SerialWrapperLifecycleTest, StartFutureReflectsTransportFailure) {
   boost::asio::io_context ioc;
 
   config::SerialConfig cfg;
-  cfg.device = "fake";
+  cfg.device = "/dev/ttyTEST";
   cfg.baud_rate = 9600;
   cfg.reopen_on_error = false;
 
@@ -348,7 +359,7 @@ TEST_F(SerialWrapperLifecycleTest, StartFutureReflectsTransportFailure) {
   EXPECT_FALSE(started.get());
   EXPECT_FALSE(serial.connected());
 
-  serial.stop();
+  wirestead::test::stop_wrapper_with_context(serial, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }

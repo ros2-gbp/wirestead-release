@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "wirestead/base/common.hpp"
 #include "wirestead/config/udp_config.hpp"
 #include "wirestead/memory/safe_span.hpp"
@@ -69,6 +70,7 @@ TEST(TransportUdpExtendedTest, AsyncWriteMove) {
   });
 
   channel->start();
+  ASSERT_TRUE(wait_for_condition(ioc, [&] { return channel->is_connected(); }, 2000ms));
 
   std::vector<uint8_t> payload = {0x01, 0x02, 0x03, 0x04};
   size_t payload_size = payload.size();
@@ -76,7 +78,7 @@ TEST(TransportUdpExtendedTest, AsyncWriteMove) {
 
   EXPECT_TRUE(wait_for_condition(ioc, [&] { return received_bytes == payload_size; }, 2000ms));
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpExtendedTest, AsyncWriteShared) {
@@ -101,6 +103,7 @@ TEST(TransportUdpExtendedTest, AsyncWriteShared) {
   });
 
   channel->start();
+  ASSERT_TRUE(wait_for_condition(ioc, [&] { return channel->is_connected(); }, 2000ms));
 
   auto payload = std::make_shared<std::vector<uint8_t>>(std::initializer_list<uint8_t>{0xAA, 0xBB});
   size_t payload_size = payload->size();
@@ -108,7 +111,7 @@ TEST(TransportUdpExtendedTest, AsyncWriteShared) {
 
   EXPECT_TRUE(wait_for_condition(ioc, [&] { return received_bytes == payload_size; }, 2000ms));
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpExtendedTest, PooledBufferWrite) {
@@ -134,6 +137,7 @@ TEST(TransportUdpExtendedTest, PooledBufferWrite) {
   });
 
   channel->start();
+  ASSERT_TRUE(wait_for_condition(ioc, [&] { return channel->is_connected(); }, 2000ms));
 
   // Use a size that fits in small pool buckets
   std::vector<uint8_t> payload(100, 0xCC);
@@ -141,7 +145,7 @@ TEST(TransportUdpExtendedTest, PooledBufferWrite) {
 
   EXPECT_TRUE(wait_for_condition(ioc, [&] { return received_bytes == payload.size(); }, 2000ms));
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpExtendedTest, BackpressureReporting) {
@@ -156,7 +160,7 @@ TEST(TransportUdpExtendedTest, BackpressureReporting) {
   boost::asio::ip::udp::socket dummy(ioc, {boost::asio::ip::udp::v4(), 0});
   cfg.remote_port = dummy.local_endpoint().port();
 
-  cfg.backpressure_threshold = 100;
+  cfg.backpressure_threshold = 1024;
 
   auto channel = transport::UdpChannel::create(cfg, ioc);
 
@@ -164,13 +168,14 @@ TEST(TransportUdpExtendedTest, BackpressureReporting) {
   std::atomic<bool> bp_cleared{false};
 
   channel->on_backpressure([&](size_t q) {
-    if (q >= 100) bp_triggered = true;
+    if (q >= cfg.backpressure_threshold) bp_triggered = true;
     if (q == 0 && bp_triggered) bp_cleared = true;
   });
 
   channel->start();
+  ASSERT_TRUE(wait_for_condition(ioc, [&] { return channel->is_connected(); }, 2000ms));
 
-  // We don't run the IOC yet, so writes should queue up
+  // Pause the ready IOC so accepted writes queue up
   // MIN_BACKPRESSURE_THRESHOLD is usually 1024, so we need > 1024 bytes to trigger it.
   std::vector<uint8_t> chunk(2000, 0xFF);
 
@@ -188,7 +193,7 @@ TEST(TransportUdpExtendedTest, BackpressureReporting) {
   EXPECT_TRUE(bp_triggered);
   EXPECT_TRUE(bp_cleared);
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpExtendedTest, CallbackExceptionSafety) {
@@ -213,5 +218,5 @@ TEST(TransportUdpExtendedTest, CallbackExceptionSafety) {
   // Should still be running/usable
   EXPECT_TRUE(ok);
   EXPECT_GT(calls, 0);
-  EXPECT_NO_THROW(channel->stop());
+  EXPECT_NO_THROW(wirestead::test::stop_with_context(channel, ioc));
 }
