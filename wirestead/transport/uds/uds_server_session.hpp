@@ -34,11 +34,13 @@
 #include "wirestead/diagnostics/error_handler.hpp"
 #include "wirestead/diagnostics/logger.hpp"
 #include "wirestead/diagnostics/runtime_stats_counter.hpp"
+#include "wirestead/diagnostics/send_accounting.hpp"
 #include "wirestead/interface/channel.hpp"
 #include "wirestead/interface/iuds_socket.hpp"
 #include "wirestead/memory/memory_pool.hpp"
 #include "wirestead/memory/safe_span.hpp"
 #include "wirestead/transport/base/bp_state_machine.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 namespace wirestead {
 namespace transport {
@@ -81,17 +83,42 @@ class WIRESTEAD_API UdsServerSession : public std::enable_shared_from_this<UdsSe
   void on_close(OnClose cb);
   bool alive() const;
   bool is_backpressure_active() const { return backpressure_active_.load(); }
+  size_t write_queue_limit() const { return bp_limit_; }
   wrapper::RuntimeStats stats() const;
   void reset_stats();
   void stop();
+  void async_stop(std::function<void()> completion);
 
  private:
+  using Ledger = diagnostics::SendAccountingLedger;
+  struct TrackedBuffer {
+    BufferVariant buffer;
+    Ledger::Request request;
+  };
+  static const BufferVariant& payload(const TrackedBuffer& item) { return item.buffer; }
+  Ledger send_accounting_;
+  void request_stop();
+  friend class UdsServer;
+  void start_with_notification(std::function<void()> notify);
+  // Admission and close share this lock. Release it before invoking callbacks
+  // that may acquire the owning server session-map lock.
+  mutable std::mutex submission_mtx_;
+  std::optional<wrapper::SendRejection> wait_ended_by_;
+  std::optional<wrapper::SendResult> poll_write_wait() const;
+  void cancel_write_wait();
+  wrapper::SendResult write_copy(memory::ConstByteSpan data);
+  wrapper::SendResult write_move(std::vector<uint8_t>&& data);
+  wrapper::SendResult write_shared(std::shared_ptr<const std::vector<uint8_t>> data);
+  wrapper::SendResult try_write_copy(memory::ConstByteSpan data);
+  wrapper::SendResult try_write_move(std::vector<uint8_t>&& data);
+  wrapper::SendResult try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data);
+
   void start_read();
   void do_write();
   void do_close();
   void report_backpressure(size_t queued_bytes);
   // Shared decide_enqueue()/route dispatch used by both async_write_* variants (#434).
-  void route_enqueued_buffer(BufferVariant&& buf, size_t added);
+  void route_enqueued_buffer(TrackedBuffer&& buf, size_t added);
   queue_util::BackpressureFields bp_fields();
   void reset_idle_timer();
   void observe_queue();
@@ -115,12 +142,12 @@ class WIRESTEAD_API UdsServerSession : public std::enable_shared_from_this<UdsSe
   // std::array: this buffer exists per connection, so a server trades memory
   // against read completions here with max_connections as the multiplier.
   std::vector<uint8_t> rx_;
-  std::deque<BufferVariant> tx_;
-  std::deque<BufferVariant> pending_;
+  std::deque<TrackedBuffer> tx_;
+  std::deque<TrackedBuffer> pending_;
   std::atomic<size_t> pending_bytes_{0};
   // Buffers handed to the in-flight gather write; current_write_views_
   // points into the batch, so neither is touched while a write is in flight.
-  std::vector<BufferVariant> current_write_batch_;
+  std::vector<TrackedBuffer> current_write_batch_;
   std::vector<net::const_buffer> current_write_views_;
   bool writing_ = false;
   std::atomic<size_t> queue_bytes_{0};
@@ -144,6 +171,7 @@ class WIRESTEAD_API UdsServerSession : public std::enable_shared_from_this<UdsSe
   OnClose on_close_;
   std::atomic<bool> alive_{false};
   std::atomic<bool> closing_{false};
+  bool cleanup_done_ = false;  // Accessed only on strand_.
 };
 }  // namespace transport
 }  // namespace wirestead

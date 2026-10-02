@@ -1,0 +1,87 @@
+/*
+ * Copyright 2025 Jinwoo Sung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <functional>
+
+namespace boost::system {
+class error_code;
+}
+
+namespace wirestead::wrapper {
+class SendResult;
+}
+
+namespace wirestead::transport::detail {
+// Internal scheduling seam. Tests can stop immediately before the completion
+// signal or observe callers reaching its wait; production leaves this null.
+inline std::atomic<void (*)()> g_tcp_io_completion_hook{nullptr};
+// Inject an initiation failure after handoff; tests must not call channel APIs here.
+inline std::atomic<void (*)()> g_tcp_write_initiation_hook{nullptr};
+// After write initiation, before completion; no admission lock held.
+inline std::atomic<void (*)()> g_tcp_write_started_hook{nullptr};
+// Pauses a TCP write after its state check, before reservation/submission.
+inline std::atomic<void (*)()> g_tcp_write_admission_hook{nullptr};
+// Pauses a connection-pinned write before acquiring the admission mutex.
+inline std::atomic<void (*)()> g_tcp_pinned_write_hook{nullptr};
+// Observe native admission outcomes after the submission lock is released.
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_tcp_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_write_admission_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_pinned_write_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_uds_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_io_completion_hook{nullptr};
+// Controlled virtual-session time for expiry boundary tests.
+inline std::atomic<std::chrono::steady_clock::time_point (*)()> g_udp_session_clock_hook{nullptr};
+inline std::atomic<void (*)()> g_udp_pinned_write_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_udp_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_udp_io_completion_hook{nullptr};
+// Handoff failure injection; do not call channel APIs under the admission lock.
+inline std::atomic<void (*)()> g_udp_write_initiation_hook{nullptr};
+// After initiation and before completion, with no admission lock held.
+inline std::atomic<void (*)()> g_udp_write_started_hook{nullptr};
+// Hold a completion while allowing the strand to process timers. Tests must
+// resume the closure on the channel executor before waiting for shutdown.
+inline std::atomic<void (*)(std::function<void()>)> g_udp_defer_write_completion_hook{nullptr};
+// Before classifying a write completion, outside the admission lock.
+inline std::atomic<void (*)()> g_udp_write_completion_hook{nullptr};
+// Override a live receive completion for terminal-read accounting regressions.
+inline std::atomic<void (*)(boost::system::error_code&)> g_udp_receive_result_hook{nullptr};
+inline std::atomic<void (*)()> g_serial_write_admission_hook{nullptr};
+inline std::atomic<void (*)()> g_serial_pinned_write_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_serial_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_serial_io_completion_hook{nullptr};
+// Snapshot taken, before any per-target fanout admission; no native locks held.
+inline std::atomic<void (*)()> g_tcp_fanout_snapshot_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_fanout_snapshot_hook{nullptr};
+// After targets move to retirement, before asynchronous session cleanup.
+inline std::atomic<void (*)()> g_server_sessions_retiring_hook{nullptr};
+using StopTestHook = void (*)(const void*, bool);
+inline std::atomic<StopTestHook> g_stop_test_hook{nullptr};
+inline void stop_test_hook(const void* object, bool completing) {
+  if (auto hook = g_stop_test_hook.load(std::memory_order_acquire)) hook(object, completing);
+}
+inline std::atomic<void (*)()> g_tcp_session_write_admission_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_tcp_session_write_result_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_tcp_server_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_session_write_admission_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_uds_session_write_result_hook{nullptr};
+inline std::atomic<void (*)(const wrapper::SendResult&)> g_uds_server_write_result_hook{nullptr};
+inline std::atomic<void (*)()> g_tcp_server_pinned_write_hook{nullptr};
+inline std::atomic<void (*)()> g_uds_server_pinned_write_hook{nullptr};
+}  // namespace wirestead::transport::detail

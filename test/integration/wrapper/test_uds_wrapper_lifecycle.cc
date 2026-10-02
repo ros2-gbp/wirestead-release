@@ -22,15 +22,22 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "server_reliable_result_test.hpp"
+#include "tcp_stop_with_context.hpp"
 #include "test/mocks/mock_uds_acceptor.hpp"
 #include "test/mocks/mock_uds_socket.hpp"
+#include "test_connection_channel.hpp"
 #include "test_utils.hpp"
 #include "wirestead/framer/line_framer.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
+#include "wirestead/transport/uds/boost_uds_acceptor.hpp"
 #include "wirestead/transport/uds/uds_client.hpp"
 #include "wirestead/transport/uds/uds_server.hpp"
+#include "wirestead/wrapper/callback_guard.hpp"
 #include "wirestead/wrapper/uds_client/uds_client.hpp"
 #include "wirestead/wrapper/uds_server/uds_server.hpp"
 #include "wrapper_contract_test_utils.hpp"
@@ -43,11 +50,17 @@ using namespace std::chrono_literals;
 namespace wirestead::wrapper {
 namespace {
 
-class ControlledUdsChannel : public interface::Channel {
+class ControlledUdsChannel : public wirestead::test::TestConnectionChannel {
  public:
-  void start() override { connected_ = true; }
+  void start() override {
+    connected_ = true;
+    connection_opened();
+  }
 
-  void stop() override { connected_ = false; }
+  void stop() override {
+    connected_ = false;
+    connection_lost();
+  }
 
   bool is_connected() const override { return connected_; }
 
@@ -55,28 +68,30 @@ class ControlledUdsChannel : public interface::Channel {
 
   boost::asio::any_io_executor get_executor() override { return ioc_.get_executor(); }
 
-  bool async_write_copy(memory::ConstByteSpan data) override {
+  SendResult async_write_copy_result(memory::ConstByteSpan data) override {
     std::lock_guard<std::mutex> lock(mutex_);
     ++write_count_;
     last_write_.assign(reinterpret_cast<const char*>(data.data()), data.size());
     return write_result_;
   }
 
-  bool async_write_move(std::vector<uint8_t>&& data) override {
-    return async_write_copy(memory::ConstByteSpan(data.data(), data.size()));
+  SendResult async_write_move_result(std::vector<uint8_t>&& data) override {
+    return async_write_copy_result(memory::ConstByteSpan(data.data(), data.size()));
   }
 
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override {
-    if (!data) return false;
-    return async_write_copy(memory::ConstByteSpan(data->data(), data->size()));
+  SendResult async_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) override {
+    if (!data) return SendResult::reject(SendRejection::InvalidArgument);
+    return async_write_copy_result(memory::ConstByteSpan(data->data(), data->size()));
   }
 
-  bool async_try_write_copy(memory::ConstByteSpan data) override { return async_write_copy(data); }
+  SendResult async_try_write_copy_result(memory::ConstByteSpan data) override { return async_write_copy_result(data); }
 
-  bool async_try_write_move(std::vector<uint8_t>&& data) override { return async_write_move(std::move(data)); }
+  SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override {
+    return async_write_move_result(std::move(data));
+  }
 
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override {
-    return async_write_shared(std::move(data));
+  SendResult async_try_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) override {
+    return async_write_shared_result(std::move(data));
   }
 
   void on_bytes(OnBytes cb) override { on_bytes_ = std::move(cb); }
@@ -93,8 +108,10 @@ class ControlledUdsChannel : public interface::Channel {
   void emit_state(base::LinkState state) {
     if (state == base::LinkState::Connected) {
       connected_ = true;
+      connection_opened();
     } else if (state == base::LinkState::Closed || state == base::LinkState::Error || state == base::LinkState::Idle) {
       connected_ = false;
+      connection_lost();
     }
 
     if (on_state_) on_state_(state);
@@ -106,7 +123,9 @@ class ControlledUdsChannel : public interface::Channel {
 
   void set_backpressure_active(bool active) { backpressure_active_ = active; }
 
-  void set_write_result(bool result) { write_result_ = result; }
+  void set_write_result(bool result) {
+    write_result_ = result ? SendResult::accept() : SendResult::reject(SendRejection::WouldBlock);
+  }
 
   int write_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -122,7 +141,7 @@ class ControlledUdsChannel : public interface::Channel {
   boost::asio::io_context ioc_;
   bool connected_{false};
   bool backpressure_active_{false};
-  bool write_result_{true};
+  SendResult write_result_{SendResult::accept()};
   mutable std::mutex mutex_;
   int write_count_{0};
   std::string last_write_;
@@ -153,7 +172,7 @@ TEST(UdsClientWrapperLifecycleTest, AutoManageStartsInjectedTransport) {
 
   EXPECT_TRUE(client.connected());
 
-  client.stop();
+  wirestead::test::stop_wrapper_with_context(client, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
@@ -162,6 +181,7 @@ TEST(UdsClientWrapperLifecycleTest, StartFutureReflectsTransportFailure) {
   boost::asio::io_context ioc;
   config::UdsClientConfig cfg;
   cfg.socket_path = test::TestUtils::makeUniqueUdsSocketPath("uwc-fail").string();
+  cfg.max_retries = 0;  // The start future fails only at terminal exhaustion.
 
   auto* mock_socket = new test::mocks::MockUdsSocket();
   auto transport_client =
@@ -180,7 +200,7 @@ TEST(UdsClientWrapperLifecycleTest, StartFutureReflectsTransportFailure) {
   ASSERT_EQ(started.wait_for(0ms), std::future_status::ready);
   EXPECT_FALSE(started.get());
 
-  client.stop();
+  wirestead::test::stop_wrapper_with_context(client, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
@@ -235,7 +255,7 @@ TEST(UdsServerWrapperLifecycleTest, AutoManageStartsInjectedTransport) {
 
   EXPECT_TRUE(server.listening());
 
-  server.stop();
+  wirestead::test::stop_wrapper_with_context(server, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
@@ -265,7 +285,7 @@ TEST(UdsServerWrapperLifecycleTest, StartFutureReflectsBindFailure) {
   EXPECT_FALSE(started.get());
   EXPECT_FALSE(server.listening());
 
-  server.stop();
+  wirestead::test::stop_wrapper_with_context(server, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
@@ -465,7 +485,9 @@ TEST(UdsServerWrapperLifecycleTest, FramedMessageBatchFlushesAtBatchSize) {
 TEST(UdsServerWrapperLifecycleTest, LineSendingVariantsReachConnectedClients) {
   test::wrapper_support::UdsServerLoopbackHarness harness("uws-line-sending");
   auto server = harness.start_server();
+  server->stop();
   server->backpressure_strategy(base::constants::BackpressureStrategy::BestEffort);
+  ASSERT_TRUE(server->start().get());
 
   std::atomic<int> received{0};
   std::string received_data;
@@ -671,10 +693,10 @@ TEST(UdsClientWrapperContractTest, StartWhileConnectedAndBestEffortWriteFailure)
 TEST(UdsClientWrapperContractTest, ConfigurationSettersBeforeStartRemainFluent) {
   UdsClient client(test::TestUtils::makeUniqueUdsSocketPath("uwc-config").string());
 
-  EXPECT_EQ(&client, &client.retry_interval(7ms));
+  EXPECT_EQ(&client, &client.retry_interval(100ms));
   EXPECT_EQ(&client, &client.max_retries(3));
-  EXPECT_EQ(&client, &client.connection_timeout(25ms));
-  EXPECT_EQ(&client, &client.backpressure_threshold(512));
+  EXPECT_EQ(&client, &client.connection_timeout(100ms));
+  EXPECT_EQ(&client, &client.backpressure_threshold(1024));
   EXPECT_EQ(&client, &client.backpressure_strategy(base::constants::BackpressureStrategy::BestEffort));
   EXPECT_EQ(&client, &client.batch_size(3));
   EXPECT_EQ(&client, &client.batch_latency(15ms));
@@ -718,10 +740,577 @@ TEST(UdsServerWrapperContractTest, ConnectHandlerReplacementUsesLatestCallback) 
   ASSERT_TRUE(wirestead::test::TestUtils::waitForCondition([&]() { return count.load() > 0; }, 5000));
   EXPECT_EQ(count.load(), 2);
 
-  server.stop();
+  wirestead::test::stop_wrapper_with_context(server, ioc);
   ioc.restart();
   ioc.run_for(50ms);
 }
 
 }  // namespace
 }  // namespace wirestead::wrapper
+
+namespace {
+thread_local std::optional<wirestead::wrapper::SendResult> nonblocking_result;
+thread_local int nonblocking_observations = 0;
+void observe_nonblocking_result(const wirestead::wrapper::SendResult& result) {
+  nonblocking_result = result;
+  ++nonblocking_observations;
+}
+
+struct NonblockingResultPeer {
+  boost::asio::io_context io;
+  std::string path = wirestead::test::TestUtils::makeUniqueUdsSocketPath("uds-result").string();
+  // Windows AF_UNIX bind rejects SO_REUSEADDR; match the native server's open/bind/listen path.
+  boost::asio::local::stream_protocol::acceptor acceptor{io, boost::asio::local::stream_protocol::endpoint(path),
+                                                         false};
+  std::shared_ptr<wirestead::transport::UdsClient> native;
+  std::unique_ptr<wirestead::wrapper::UdsClient> client;
+  explicit NonblockingResultPeer(bool best_effort) {
+    wirestead::config::UdsClientConfig cfg;
+    cfg.socket_path = path;
+    cfg.backpressure_threshold = 1024;
+    cfg.backpressure_strategy = best_effort ? wirestead::base::constants::BackpressureStrategy::BestEffort
+                                            : wirestead::base::constants::BackpressureStrategy::Reliable;
+    native = wirestead::transport::UdsClient::create(cfg, io);
+    client = std::make_unique<wirestead::wrapper::UdsClient>(native);
+    client->backpressure_strategy(cfg.backpressure_strategy);
+    wirestead::wrapper::detail::g_uds_send_result_hook.store(observe_nonblocking_result);
+  }
+  ~NonblockingResultPeer() {
+    wirestead::wrapper::detail::g_uds_send_result_hook.store(nullptr);
+    wirestead::test::stop_wrapper_with_context(*client, io);
+    acceptor.close();
+    wirestead::test::TestUtils::removeFileIfExists(path);
+  }
+  template <typename Predicate>
+  bool until(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (io.stopped()) io.restart();
+      io.run_for(std::chrono::milliseconds(10));
+    }
+    return true;
+  }
+};
+
+class UdsNonblockingResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsNonblockingResultTest, OrdersValidationLifecycleAndCapacityReasons) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  const bool best_effort = GetParam() >= 4 && GetParam() < 8;
+  const int form = GetParam() % 4;
+  // Explicit try methods must stay WouldBlock even on a BestEffort channel.
+  NonblockingResultPeer peer(GetParam() >= 4);
+  auto& client = *peer.client;
+  std::optional<wirestead::wrapper::SendResult> returned_result;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    auto accepted = wirestead::wrapper::SendResult::reject(wirestead::wrapper::SendRejection::NotReady);
+    if (form == 0) {
+      accepted = best_effort ? client.send(text) : client.try_send(text);
+    } else if (form == 1) {
+      accepted = best_effort ? client.send_line(text) : client.try_send_line(text);
+    } else if (form == 2) {
+      std::vector<uint8_t> payload(text.begin(), text.end());
+      accepted = best_effort ? client.send_move(std::move(payload)) : client.try_send_move(std::move(payload));
+      if (!accepted) {
+        EXPECT_EQ(std::string(payload.begin(), payload.end()), text);
+      }
+    } else {
+      auto payload = std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end());
+      accepted = best_effort ? client.send_shared(payload) : client.try_send_shared(payload);
+    }
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (nonblocking_result) {
+      EXPECT_EQ(nonblocking_result->accepted(), accepted.accepted());
+    }
+    returned_result = accepted;
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(returned_result.has_value());
+    ASSERT_FALSE(returned_result->accepted());
+    EXPECT_EQ(returned_result->reason(), expected);
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  if (form != 1) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  // Line delimiters count against the hard queue limit before state/capacity.
+  const std::string oversized(*peer.native->write_queue_limit() + (form == 1 ? 0 : 1), 'x');
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  EXPECT_EQ(peer.native->stats().failed_sends, 0u);
+
+  auto started = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  // Fill high-water without running the executor again.
+  ASSERT_TRUE(client.try_send(std::string(1024, 'f')));
+  EXPECT_FALSE(write("valid"));
+  reason(best_effort ? Rejection::QueueFull : Rejection::WouldBlock);
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+
+  bool stopped_on_executor = false;
+  boost::asio::post(peer.io, [&] {
+    client.stop();
+    EXPECT_FALSE(write("valid"));
+    reason(Rejection::Stopping);
+    EXPECT_FALSE(write(oversized));
+    reason(Rejection::TooLarge);
+    stopped_on_executor = true;
+  });
+  ASSERT_TRUE(peer.until([&] { return stopped_on_executor; }));
+  wirestead::test::stop_wrapper_with_context(client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  auto restarted = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(restarted.get());
+  EXPECT_TRUE(write("valid"));
+}
+
+INSTANTIATE_TEST_SUITE_P(TryAndBestEffortForms, UdsNonblockingResultTest, ::testing::Range(0, 12));
+
+TEST(UdsNonblockingResultContract, ConnectedNativeStillRequiresWrapperStart) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  NonblockingResultPeer peer(false);
+  peer.native->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  EXPECT_FALSE(peer.client->try_send("before wrapper start"));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), Rejection::NotStarted);
+  EXPECT_EQ(peer.native->stats().messages_accepted, 0u);
+  ASSERT_TRUE(peer.client->start().get());
+  EXPECT_TRUE(peer.client->try_send("after wrapper start"));
+}
+
+TEST(UdsNonblockingResultContract, NullSharedPayloadIsInvalidBeforeStartAndAfterStop) {
+  NonblockingResultPeer peer(true);
+  EXPECT_FALSE(peer.client->send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::InvalidArgument);
+  peer.client->stop();
+  EXPECT_FALSE(peer.client->try_send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::InvalidArgument);
+}
+
+class UdsReliableResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsReliableResultTest, ValidatesBeforeStateAndPreservesPayload) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  // The last two cases exercise explicit blocking under BestEffort.
+  NonblockingResultPeer peer(GetParam() >= 6);
+  const int form = GetParam() >= 6 ? GetParam() - 4 : GetParam();
+  auto& client = *peer.client;
+  std::optional<wirestead::wrapper::SendResult> returned_result;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    auto accepted = wirestead::wrapper::SendResult::reject(wirestead::wrapper::SendRejection::NotReady);
+    if (form == 0)
+      accepted = client.send(text);
+    else if (form == 1)
+      accepted = client.send_line(text);
+    else if (form == 2)
+      accepted = client.send_blocking(text);
+    else if (form == 3)
+      accepted = client.send_line_blocking(text);
+    else if (form == 4) {
+      std::vector<uint8_t> payload(text.begin(), text.end());
+      accepted = client.send_move(std::move(payload));
+      if (!accepted) {
+        EXPECT_EQ(std::string(payload.begin(), payload.end()), text);
+      }
+    } else
+      accepted = client.send_shared(std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end()));
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (nonblocking_result) {
+      EXPECT_EQ(nonblocking_result->accepted(), accepted.accepted());
+    }
+    returned_result = accepted;
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(returned_result.has_value());
+    ASSERT_FALSE(returned_result->accepted());
+    EXPECT_EQ(returned_result->reason(), expected);
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+  const bool line = form == 1 || form == 3;
+  const std::string oversized(*peer.native->write_queue_limit() + (line ? 0 : 1), 'x');
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  if (!line) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  EXPECT_EQ(peer.native->stats().failed_sends, 0u);
+  auto started = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  {
+    wirestead::wrapper::detail::CallbackGuard guard;
+    EXPECT_TRUE(write("capacity available in callback"));
+  }
+  wirestead::test::stop_wrapper_with_context(client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  EXPECT_FALSE(client.send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), Rejection::InvalidArgument);
+}
+INSTANTIATE_TEST_SUITE_P(ReliableAndExplicitBlocking, UdsReliableResultTest, ::testing::Range(0, 8));
+
+TEST(UdsReliableResultContract, NativeCapacityRetriesBeyondFiveAndStopReleasesSender) {
+  NonblockingResultPeer peer(false);
+  auto started = peer.client->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit(), 'f')));
+  const auto failures = peer.native->stats().failed_sends;
+  std::vector<uint8_t> payload{1, 2, 3};
+  auto sender = std::async(std::launch::async, [&] { return peer.client->send_move(std::move(payload)); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (peer.native->stats().failed_sends < failures + 12 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool retried = peer.native->stats().failed_sends >= failures + 12;
+  auto stopper = std::async(std::launch::async, [&] { peer.client->stop(); });
+  // Stop cancels the retained wait before waiting for native executor cleanup.
+  const bool released = sender.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(peer.until([&] { return stopper.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready; }));
+  stopper.get();
+  ASSERT_TRUE(released);
+  const auto result = sender.get();
+  EXPECT_TRUE(retried);
+  EXPECT_FALSE(result.accepted());
+  EXPECT_TRUE(result.reason() == wirestead::wrapper::SendRejection::CancelledWhileWaiting ||
+              result.reason() == wirestead::wrapper::SendRejection::Stopping);
+  EXPECT_EQ(payload, (std::vector<uint8_t>{1, 2, 3}));
+}
+
+TEST(UdsReliableResultContract, CallbackCapacityRefusalPreservesMoveStorage) {
+  NonblockingResultPeer peer(false);
+  auto started = peer.client->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  // Keep the executor paused: inflight reservations fill the hard limit but
+  // have not yet published high-water pressure. Callback callers must not retry.
+  ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit(), 'f')));
+  ASSERT_FALSE(peer.native->is_backpressure_active());
+  wirestead::wrapper::detail::CallbackGuard callback_scope;
+  const auto failures = peer.native->stats().failed_sends;
+  for (int form = 0; form < 3; ++form) {
+    nonblocking_observations = 0;
+    std::vector<uint8_t> payload{1, 2, 3};
+    if (form == 0) {
+      EXPECT_FALSE(peer.client->send_blocking("copy"));
+    } else if (form == 1) {
+      EXPECT_FALSE(peer.client->send_move(std::move(payload)));
+      EXPECT_EQ(payload, (std::vector<uint8_t>{1, 2, 3}));
+    } else {
+      EXPECT_FALSE(peer.client->send_shared(std::make_shared<const std::vector<uint8_t>>(payload)));
+    }
+    ASSERT_TRUE(nonblocking_result.has_value());
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::WouldBlock);
+    EXPECT_EQ(peer.native->stats().failed_sends, failures + (form + 1));
+    EXPECT_EQ(peer.native->stats().messages_accepted, 1u);
+  }
+}
+}  // namespace
+
+namespace {
+class UdsNativeResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsNativeResultTest, ReportsLifecycleValidationAndCapacityAtAdmission) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  NonblockingResultPeer peer(GetParam() >= 6);
+  wirestead::transport::detail::g_uds_write_result_hook.store(observe_nonblocking_result);
+  struct ResetHook {
+    ~ResetHook() { wirestead::transport::detail::g_uds_write_result_hook.store(nullptr); }
+  } reset_hook;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    std::vector<uint8_t> data(text.begin(), text.end());
+    bool accepted;
+    switch (GetParam() % 6) {
+      case 0:
+        accepted = peer.native->async_write_copy({data.data(), data.size()});
+        break;
+      case 1:
+        accepted = peer.native->async_write_move(std::move(data));
+        break;
+      case 2:
+        accepted = peer.native->async_write_shared(std::make_shared<const std::vector<uint8_t>>(data));
+        break;
+      case 3:
+        accepted = peer.native->async_try_write_copy({data.data(), data.size()});
+        break;
+      case 4:
+        accepted = peer.native->async_try_write_move(std::move(data));
+        break;
+      default:
+        accepted = peer.native->async_try_write_shared(std::make_shared<const std::vector<uint8_t>>(data));
+        break;
+    }
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (!accepted) {
+      EXPECT_EQ(std::string(data.begin(), data.end()), text);
+    }
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  auto started = peer.client->start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  EXPECT_FALSE(write(""));
+  reason(Rejection::InvalidArgument);
+  EXPECT_TRUE(write("accepted"));
+  ASSERT_TRUE(nonblocking_result->accepted());
+  if (GetParam() % 6 < 3) {
+    ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit() - 8, 'f')));
+  } else {
+    ASSERT_TRUE(peer.native->async_try_write_move(std::vector<uint8_t>(1024 - 8, 'f')));
+  }
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::WouldBlock);
+  // Stop on the executor, while completion is still pending.
+  bool requested = false;
+  boost::asio::post(peer.io, [&] {
+    peer.native->stop();
+    EXPECT_FALSE(write("valid"));
+    reason(Rejection::Stopping);
+    requested = true;
+  });
+  ASSERT_TRUE(peer.until([&] { return requested; }));
+  wirestead::test::stop_wrapper_with_context(*peer.client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+}
+INSTANTIATE_TEST_SUITE_P(FormsAndStrategies, UdsNativeResultTest, ::testing::Range(0, 12));
+}  // namespace
+
+namespace {
+thread_local std::optional<wirestead::wrapper::SendResult> target_result;
+thread_local int target_observations = 0;
+void observe_target_result(const wirestead::wrapper::SendResult& result) {
+  target_result = result;
+  ++target_observations;
+}
+class UdsServerTargetResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsServerTargetResultTest, CombinesValidationLifecycleAndSessionAdmission) {
+  using namespace wirestead;
+  using Rejection = wrapper::SendRejection;
+  boost::asio::io_context io;
+  config::UdsServerConfig cfg;
+  cfg.socket_path = test::TestUtils::makeUniqueUdsSocketPath("target-result").string();
+  cfg.backpressure_threshold = 1024;
+  cfg.backpressure_strategy = (GetParam() >= 2 && GetParam() < 11) || GetParam() == 14
+                                  ? base::constants::BackpressureStrategy::BestEffort
+                                  : base::constants::BackpressureStrategy::Reliable;
+  auto native = transport::UdsServer::create(cfg, std::make_unique<transport::BoostUdsAcceptor>(io), io);
+  wrapper::UdsServer server(native);
+  server.backpressure_strategy(GetParam() >= 11 && GetParam() < 14 ? base::constants::BackpressureStrategy::Reliable
+                                                                   : cfg.backpressure_strategy);
+  wrapper::detail::g_uds_server_send_result_hook.store(observe_target_result);
+  transport::detail::g_uds_server_write_result_hook.store(observe_target_result);
+  struct Cleanup {
+    std::function<void()> action;
+    ~Cleanup() { action(); }
+  } cleanup{[&] {
+    wrapper::detail::g_uds_server_send_result_hook.store(nullptr);
+    transport::detail::g_uds_server_write_result_hook.store(nullptr);
+    test::stop_wrapper_with_context(server, io);
+    test::TestUtils::removeFileIfExists(cfg.socket_path);
+  }};
+  auto until = [&](auto predicate) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (io.stopped()) io.restart();
+      io.run_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  };
+  ClientId id = 999;
+  const bool native_form = GetParam() >= 6 && GetParam() < 10;
+  const bool reliable_form = GetParam() >= 11;
+  const bool line_form = (!native_form && GetParam() < 11 && GetParam() % 2) || GetParam() == 12;
+  auto write = [&](std::string_view data) {
+    target_result.reset();
+    target_observations = 0;
+    bool accepted;
+    auto public_acceptance = [&](wrapper::SendResult result) {
+      EXPECT_TRUE(target_result.has_value());
+      if (target_result) {
+        EXPECT_EQ(target_result->accepted(), result.accepted());
+        if (!result.accepted() && !target_result->accepted()) {
+          EXPECT_EQ(target_result->reason(), result.reason());
+        }
+      }
+      target_result = result;
+      return result.accepted();
+    };
+    if (reliable_form) {
+      if (GetParam() == 11)
+        accepted = public_acceptance(server.send_to(id, data));
+      else if (GetParam() == 12)
+        accepted = public_acceptance(server.send_to_line(id, data));
+      else
+        accepted = public_acceptance(server.send_to_blocking(id, data));
+    } else if (native_form) {
+      if (GetParam() == 6)
+        accepted = native->send_to_client(id, data);
+      else if (GetParam() == 7)
+        accepted = native->try_send_to_client(id, data);
+      else if (GetParam() == 8)
+        accepted = native->send_to_client(
+            id, memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+      else
+        accepted = native->try_send_to_client(
+            id, memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    } else if (GetParam() >= 2 && GetParam() < 4) {
+      accepted = public_acceptance(GetParam() % 2 ? server.send_to_line(id, data) : server.send_to(id, data));
+    } else {
+      accepted = public_acceptance(GetParam() % 2 ? server.try_send_to_line(id, data) : server.try_send_to(id, data));
+    }
+    EXPECT_EQ(target_observations, 1);
+    EXPECT_TRUE(target_result.has_value());
+    if (target_result) {
+      EXPECT_EQ(target_result->accepted(), accepted);
+    }
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(target_result.has_value());
+    ASSERT_FALSE(target_result->accepted());
+    EXPECT_EQ(target_result->reason(), expected);
+  };
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  if (!native_form && !line_form) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  if (GetParam() == 10) {
+    native->start();
+    ASSERT_TRUE(until([&] { return server.listening(); }));
+    EXPECT_FALSE(write("native running before wrapper start"));
+    reason(Rejection::NotStarted);
+  }
+  auto ready = server.start();
+  ASSERT_TRUE(until([&] { return ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }));
+  ASSERT_TRUE(ready.get());
+  EXPECT_FALSE(write("missing"));
+  reason(Rejection::NotReady);
+  boost::asio::local::stream_protocol::socket peer(io);
+  peer.connect(boost::asio::local::stream_protocol::endpoint(cfg.socket_path));
+  ASSERT_TRUE(until([&] { return native->client_count() == 1; }));
+  id = native->connected_clients().front();
+  if (!native_form) {
+    const auto failures = native->stats().failed_sends;
+    EXPECT_FALSE(write(std::string(*native->write_queue_limit(id) + 1, 'x')));
+    reason(Rejection::TooLarge);
+    EXPECT_EQ(native->stats().failed_sends, failures);
+  }
+  EXPECT_TRUE(write("ok"));
+  const bool ordinary = reliable_form || (native_form && GetParam() % 2 == 0);
+  const size_t used = line_form ? 3 : 2;
+  const auto fill = ordinary ? *native->write_queue_limit(id) - used : 1024 - used;
+  if (ordinary)
+    ASSERT_TRUE(native->send_to_client(id, std::string(fill, 'f')));
+  else
+    ASSERT_TRUE(native->try_send_to_client(id, std::string(fill, 'f')));
+  const auto failures_before = native->stats().failed_sends;
+  {
+    // A paused executor cannot free this reservation. Callback callers must
+    // refuse immediately; independent tests cover unbounded retries and stop.
+    wrapper::detail::CallbackGuard callback;
+    EXPECT_FALSE(write("full"));
+    reason(GetParam() >= 2 && GetParam() < 4 ? Rejection::QueueFull : Rejection::WouldBlock);
+  }
+  if (reliable_form) {
+    EXPECT_EQ(native->stats().failed_sends, failures_before + 1);
+    {
+      wrapper::detail::CallbackGuard callback;
+      EXPECT_FALSE(write("callback"));
+      reason(Rejection::WouldBlock);
+    }
+    EXPECT_EQ(native->stats().failed_sends, failures_before + 2);
+    const auto failures = native->stats().failed_sends;
+    EXPECT_FALSE(write(std::string(*native->write_queue_limit(id) + 1, 'x')));
+    reason(Rejection::TooLarge);
+    EXPECT_EQ(native->stats().failed_sends, failures);
+  }
+  peer.close();
+  ASSERT_TRUE(until([&] { return native->client_count() == 0; }));
+  EXPECT_FALSE(write("disconnected"));
+  reason(Rejection::NotReady);
+  bool stopped = false;
+  boost::asio::post(io, [&] {
+    server.stop();
+    EXPECT_FALSE(write("stopping"));
+    reason(Rejection::Stopping);
+    stopped = true;
+  });
+  ASSERT_TRUE(until([&] { return stopped; }));
+  test::stop_wrapper_with_context(server, io);
+  EXPECT_FALSE(write("stopped"));
+  reason(Rejection::NotStarted);
+}
+INSTANTIATE_TEST_SUITE_P(WrapperAndNativeForms, UdsServerTargetResultTest, ::testing::Range(0, 15));
+}  // namespace
+
+namespace {
+class UdsServerReliableWaitResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsServerReliableWaitResultTest, PreservesFirstCauseAndPinsAdmission) {
+  using namespace wirestead;
+  boost::asio::io_context io;
+  config::UdsServerConfig cfg;
+  cfg.socket_path = test::TestUtils::makeUniqueUdsSocketPath("server-reliable").string();
+  cfg.backpressure_threshold = 1024;
+  test::server_wait::OnExit remove_path{[&] { test::TestUtils::removeFileIfExists(cfg.socket_path); }};
+  auto native = transport::UdsServer::create(cfg, std::make_unique<transport::BoostUdsAcceptor>(io), io);
+  boost::asio::local::stream_protocol::socket peer(io);
+  test::server_wait::run_case<wrapper::UdsServer>(
+      GetParam() / 4, GetParam() % 4, io, native, peer,
+      [&](auto& socket) { socket.connect(boost::asio::local::stream_protocol::endpoint(cfg.socket_path)); },
+      {wrapper::detail::g_uds_server_send_result_hook, wrapper::detail::g_uds_server_capacity_wait_hook,
+       wrapper::detail::g_uds_server_capacity_wait_result_hook, transport::detail::g_uds_server_pinned_write_hook});
+}
+INSTANTIATE_TEST_SUITE_P(FormsAndTerminalEvents, UdsServerReliableWaitResultTest, ::testing::Range(0, 44));
+}  // namespace

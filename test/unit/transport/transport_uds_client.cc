@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "test/mocks/mock_uds_socket.hpp"
 #include "test_constants.hpp"
 #include "test_utils.hpp"
@@ -63,7 +64,7 @@ class TransportUdsClientTest : public ::testing::Test {
 
   void TearDown() override {
     if (client) {
-      client->stop();
+      wirestead::test::stop_with_context(client, ioc);
       client.reset();
     }
     TestUtils::removeFileIfExists(cfg.socket_path);
@@ -131,7 +132,9 @@ TEST_F(TransportUdsClientTest, ConnectionFailure) {
       }));
 
   std::atomic<bool> has_error{false};
-  client->on_state([&has_error](base::LinkState state) {
+  std::atomic<base::LinkState> last_state{base::LinkState::Idle};
+  client->on_state([&](base::LinkState state) {
+    last_state = state;
     if (state == base::LinkState::Error) {
       has_error = true;
     }
@@ -142,7 +145,8 @@ TEST_F(TransportUdsClientTest, ConnectionFailure) {
   ioc.run_for(std::chrono::milliseconds(100));
 
   EXPECT_FALSE(client->is_connected());
-  EXPECT_TRUE(has_error);
+  EXPECT_FALSE(has_error);
+  EXPECT_EQ(last_state.load(), base::LinkState::Connecting);
 }
 
 // Regression test for jwsung91/wirestead#445: record_error()'s retry_count
@@ -246,28 +250,11 @@ TEST_F(TransportUdsClientTest, StartWhileConnectingIsIgnored) {
   ioc.run_for(std::chrono::milliseconds(20));
 }
 
-TEST_F(TransportUdsClientTest, InvalidConfigMovesToErrorAndRecordsLastError) {
+TEST_F(TransportUdsClientTest, InvalidConfigIsRejectedBeforeConstruction) {
   cfg.socket_path.clear();
-  auto local_mock = new MockUdsSocket();
-  EXPECT_CALL(*local_mock, close(_)).Times(AnyNumber());
-  auto local_client = UdsClient::create(cfg, std::unique_ptr<interface::UdsSocketInterface>(local_mock), ioc);
-
-  std::atomic<bool> error_seen{false};
-  local_client->on_state([&](base::LinkState state) {
-    if (state == base::LinkState::Error) {
-      error_seen = true;
-    }
-  });
-
-  local_client->start();
-  ioc.restart();
-  ioc.run_for(std::chrono::milliseconds(50));
-
-  EXPECT_TRUE(error_seen.load());
-  ASSERT_TRUE(local_client->last_error_info().has_value());
-  EXPECT_EQ(local_client->last_error_info()->category, diagnostics::ErrorCategory::CONFIGURATION);
-
-  local_client->stop();
+  auto socket = std::make_unique<MockUdsSocket>();
+  EXPECT_CALL(*socket, close(_)).Times(AnyNumber());
+  EXPECT_THROW(UdsClient::create(cfg, std::move(socket), ioc), std::invalid_argument);
 }
 
 TEST_F(TransportUdsClientTest, ConnectionTimeoutRecordsLastError) {
@@ -301,7 +288,7 @@ TEST_F(TransportUdsClientTest, ConnectionTimeoutRecordsLastError) {
   ASSERT_TRUE(local_client->last_error_info().has_value());
   EXPECT_EQ(local_client->last_error_info()->operation, "connect");
 
-  local_client->stop();
+  wirestead::test::stop_with_context(local_client, ioc);
 }
 
 TEST_F(TransportUdsClientTest, ReadCallbackReceivesDataThenCloseSchedulesRetry) {
@@ -331,7 +318,9 @@ TEST_F(TransportUdsClientTest, ReadCallbackReceivesDataThenCloseSchedulesRetry) 
   std::atomic<bool> error_seen{false};
   client->on_bytes(
       [&](memory::ConstByteSpan data) { received.assign(reinterpret_cast<const char*>(data.data()), data.size()); });
+  std::atomic<base::LinkState> last_state{base::LinkState::Idle};
   client->on_state([&](base::LinkState state) {
+    last_state = state;
     if (state == base::LinkState::Error) {
       error_seen = true;
     }
@@ -342,7 +331,10 @@ TEST_F(TransportUdsClientTest, ReadCallbackReceivesDataThenCloseSchedulesRetry) 
   ioc.run_for(std::chrono::milliseconds(100));
 
   EXPECT_EQ(received, payload);
-  EXPECT_TRUE(error_seen.load());
+  EXPECT_FALSE(error_seen.load());
+  EXPECT_EQ(last_state.load(), base::LinkState::Connecting);
+  ASSERT_TRUE(client->last_error_info());
+  EXPECT_EQ(client->last_error_info()->boost_error, make_error_code(boost::asio::error::eof));
 }
 
 TEST_F(TransportUdsClientTest, MoveAndSharedWritesUseSocket) {
@@ -439,7 +431,7 @@ TEST_F(TransportUdsClientTest, BackpressureCallbackExceptionsAreSwallowed) {
   });
   EXPECT_TRUE(local_client->is_backpressure_active());
 
-  local_client->stop();
+  wirestead::test::stop_with_context(local_client, ioc);
 }
 
 // #446: UdsClient's move ctor/assignment are defaulted (and public, unlike
@@ -461,3 +453,130 @@ TEST(TransportUdsClientMoveTest, DestroyingAMovedFromInstanceDoesNotCrash) {
 
   TestUtils::removeFileIfExists(cfg.socket_path);
 }
+
+namespace {
+// Delays old write completions across a reconnect and borrows the real gather
+// views, so ASan also checks the lifetime promised to socket implementations.
+class DelayedUdsSocket final : public interface::UdsSocketInterface {
+ public:
+  using Handler = std::function<void(const boost::system::error_code&, size_t)>;
+  struct Write {
+    std::vector<boost::asio::const_buffer> views;
+    Handler handler;
+  };
+  boost::asio::io_context& io;
+  Handler read;
+  std::vector<Write> writes;
+  bool retain_writes = true;
+  explicit DelayedUdsSocket(boost::asio::io_context& context) : io(context) {}
+  void async_connect(const boost::asio::local::stream_protocol::endpoint&,
+                     std::function<void(const boost::system::error_code&)> handler) override {
+    boost::asio::post(io, [handler = std::move(handler)] { handler({}); });
+  }
+  void async_read_some(const boost::asio::mutable_buffer&, Handler handler) override { read = std::move(handler); }
+  void async_write(const boost::asio::const_buffer& buffer, Handler handler) override {
+    writes.push_back({{buffer}, std::move(handler)});
+  }
+  void async_write(const std::vector<boost::asio::const_buffer>& buffers, Handler handler) override {
+    writes.push_back({buffers, std::move(handler)});
+  }
+  void shutdown(boost::asio::local::stream_protocol::socket::shutdown_type, boost::system::error_code&) override {}
+  void close(boost::system::error_code&) override {
+    if (auto handler = std::move(read)) handler(boost::asio::error::operation_aborted, 0);
+    if (!retain_writes) {
+      for (auto& write : writes)
+        if (auto handler = std::move(write.handler)) handler(boost::asio::error::operation_aborted, 0);
+    }
+  }
+  boost::asio::local::stream_protocol::endpoint remote_endpoint(boost::system::error_code&) const override {
+    return {};
+  }
+  std::string contents(size_t index) const {
+    std::string result;
+    for (auto view : writes.at(index).views) result.append(static_cast<const char*>(view.data()), view.size());
+    return result;
+  }
+  void complete(size_t index) {
+    const auto size = boost::asio::buffer_size(writes.at(index).views);
+    auto handler = std::move(writes.at(index).handler);
+    handler({}, size);
+  }
+};
+
+class UdsConnectionFenceTest : public ::testing::TestWithParam<int> {};
+TEST_P(UdsConnectionFenceTest, DropsQueuedAndPostedWritesAndKeepsOldBuffersAlive) {
+  boost::asio::io_context io;
+  config::UdsClientConfig cfg;
+  cfg.socket_path = TestUtils::makeUniqueUdsSocketPath("uds-fence").string();
+  cfg.retry_interval_ms = 100;
+  cfg.enable_memory_pool = (GetParam() / 6) % 2 == 0;
+  cfg.backpressure_strategy = GetParam() >= 12 ? base::constants::BackpressureStrategy::BestEffort
+                                               : base::constants::BackpressureStrategy::Reliable;
+  auto socket = std::make_unique<DelayedUdsSocket>(io);
+  auto* delayed = socket.get();
+  auto client = transport::UdsClient::create(cfg, std::move(socket), io);
+  struct Cleanup {
+    std::function<void()> action;
+    ~Cleanup() { action(); }
+  } cleanup{[&] {
+    delayed->retain_writes = false;
+    wirestead::test::stop_with_context(client, io);
+  }};
+  auto pump = [&] {
+    if (io.stopped()) io.restart();
+    io.run_for(std::chrono::milliseconds(20));
+  };
+  auto write = [&](std::string text) {
+    std::vector<uint8_t> payload(text.begin(), text.end());
+    switch (GetParam() % 6) {
+      case 0:
+        return client->async_write_copy(memory::ConstByteSpan(payload.data(), payload.size()));
+      case 1:
+        return client->async_write_move(std::move(payload));
+      case 2:
+        return client->async_write_shared(std::make_shared<const std::vector<uint8_t>>(payload));
+      case 3:
+        return client->async_try_write_copy(memory::ConstByteSpan(payload.data(), payload.size()));
+      case 4:
+        return client->async_try_write_move(std::move(payload));
+      default:
+        return client->async_try_write_shared(std::make_shared<const std::vector<uint8_t>>(payload));
+    }
+  };
+  client->start();
+  pump();
+  ASSERT_TRUE(client->is_connected());
+  ASSERT_TRUE(write("active-old"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 1u);
+  ASSERT_TRUE(write("queued-old"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 1u);
+  // Put loss ahead of an already accepted submission's strand handler.
+  boost::asio::post(client->get_executor(), [&] {
+    auto handler = std::move(delayed->read);
+    handler(boost::asio::error::eof, 0);
+  });
+  ASSERT_TRUE(write("posted-old"));
+  pump();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!client->is_connected() && std::chrono::steady_clock::now() < deadline) pump();
+  ASSERT_TRUE(client->is_connected());
+  EXPECT_EQ(delayed->contents(0), "active-old");
+  EXPECT_EQ(client->stats().dropped_messages, 3u);
+  ASSERT_TRUE(write("new"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 2u);
+  EXPECT_EQ(delayed->contents(1), "new");
+  const auto queued = client->stats().queued_bytes;
+  delayed->complete(0);
+  pump();
+  EXPECT_EQ(client->stats().queued_bytes, queued);
+  EXPECT_EQ(client->stats().bytes_sent, 0u);
+  delayed->complete(1);
+  pump();
+  EXPECT_EQ(client->stats().bytes_sent, 3u);
+  EXPECT_EQ(client->stats().queued_bytes, 0u);
+}
+INSTANTIATE_TEST_SUITE_P(FormsPoolAndStrategy, UdsConnectionFenceTest, ::testing::Range(0, 24));
+}  // namespace
