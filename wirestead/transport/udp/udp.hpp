@@ -25,7 +25,8 @@
 #include "wirestead/base/visibility.hpp"
 #include "wirestead/config/udp_config.hpp"
 #include "wirestead/diagnostics/error_types.hpp"
-#include "wirestead/interface/channel.hpp"
+#include "wirestead/interface/result_channel.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 namespace boost {
 namespace asio {
@@ -34,12 +35,19 @@ class io_context;
 }  // namespace boost
 
 namespace wirestead {
+namespace wrapper {
+class UdpClient;
+class UdpServer;
+}  // namespace wrapper
 namespace transport {
+namespace detail {
+struct UdpWriteWait;
+}
 
 /**
  * @brief UDP Transport implementation with 1:N support
  */
-class WIRESTEAD_API UdpChannel : public interface::Channel, public std::enable_shared_from_this<UdpChannel> {
+class WIRESTEAD_API UdpChannel : public interface::ResultChannel, public std::enable_shared_from_this<UdpChannel> {
  public:
   using OnBytesFrom = std::function<void(memory::ConstByteSpan, const boost::asio::ip::udp::endpoint&)>;
 
@@ -60,17 +68,20 @@ class WIRESTEAD_API UdpChannel : public interface::Channel, public std::enable_s
   void stop() override;
   bool is_connected() const override;
   bool is_backpressure_active() const override;
+  std::optional<size_t> write_queue_limit() const override;
   wrapper::RuntimeStats stats() const override;
   void reset_stats() override;
   std::optional<diagnostics::ErrorInfo> last_error_info() const override;
 
   // 1:1 writes (using configured remote_endpoint_)
-  bool async_write_copy(memory::ConstByteSpan data) override;
-  bool async_write_move(std::vector<uint8_t>&& data) override;
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
-  bool async_try_write_copy(memory::ConstByteSpan data) override;
-  bool async_try_write_move(std::vector<uint8_t>&& data) override;
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
 
   // 1:N writes (explicit destination)
   virtual bool async_write_to(memory::ConstByteSpan data, const boost::asio::ip::udp::endpoint& destination);
@@ -90,11 +101,35 @@ class WIRESTEAD_API UdpChannel : public interface::Channel, public std::enable_s
   boost::asio::ip::udp::endpoint local_endpoint() const;
 
   /**
-   * @brief Get the ASIO executor for this channel.
+   * @brief Get the strand shared by channel I/O and wrapper timers.
    */
   boost::asio::any_io_executor get_executor() override;
 
  private:
+  friend class wrapper::UdpClient;
+  friend class wrapper::UdpServer;
+  std::shared_ptr<detail::UdpWriteWait> capture_write_wait(bool require_remote = true, bool track_session = false);
+  std::optional<wrapper::SendResult> poll_write_wait(const std::shared_ptr<detail::UdpWriteWait>& wait);
+  void end_write_wait(const std::shared_ptr<detail::UdpWriteWait>& wait, wrapper::SendRejection reason);
+  void cancel_write_waits();
+  void expire_session(const std::shared_ptr<detail::UdpWriteWait>& wait);
+  wrapper::RuntimeStats session_stats(const std::shared_ptr<detail::UdpWriteWait>& wait) const;
+  std::optional<uint64_t> write_connection() const;
+  wrapper::SendResult write_state(bool require_remote = true);
+  wrapper::SendResult write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult try_write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult try_write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                   std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                       std::optional<uint64_t> expected_run = std::nullopt);
+  wrapper::SendResult write_to(memory::ConstByteSpan data, const boost::asio::ip::udp::endpoint& destination,
+                               std::optional<uint64_t> expected_run = std::nullopt,
+                               std::shared_ptr<detail::UdpWriteWait> session = {});
+  wrapper::SendResult try_write_to(memory::ConstByteSpan data, const boost::asio::ip::udp::endpoint& destination,
+                                   std::optional<uint64_t> expected_run = std::nullopt,
+                                   std::shared_ptr<detail::UdpWriteWait> session = {});
   explicit UdpChannel(const config::UdpConfig& cfg);
   UdpChannel(const config::UdpConfig& cfg, boost::asio::io_context& ioc);
 

@@ -23,10 +23,15 @@
 #include <memory>
 #include <optional>
 
+#include "tcp_stop_with_context.hpp"
+#include "test_utils.hpp"
 #include "wirestead/config/serial_config.hpp"
 #include "wirestead/interface/iserial_port.hpp"
 #include "wirestead/memory/safe_span.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
 #include "wirestead/transport/serial/serial.hpp"
+#include "wirestead/wrapper/callback_guard.hpp"
+#include "wirestead/wrapper/serial/serial.hpp"
 
 using namespace wirestead;
 using namespace wirestead::transport;
@@ -193,7 +198,7 @@ TEST(TransportSerialTest, CreateProvidesSharedFromThis) {
     auto self = serial->shared_from_this();
     EXPECT_EQ(self.get(), serial.get());
   });
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
 }
 
 // The whole point of cfg_.low_latency is that it reaches the driver, and that a
@@ -216,12 +221,7 @@ TEST(TransportSerialTest, LowLatencyIsRequestedByDefault) {
 
   EXPECT_EQ(port_raw->low_latency_requests(), 1);
   EXPECT_TRUE(connected.load());
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -237,12 +237,7 @@ TEST(TransportSerialTest, LowLatencyDisabledLeavesTheDriverAlone) {
   ioc.run_for(20ms);
 
   EXPECT_EQ(port_raw->low_latency_requests(), 0);
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -267,12 +262,7 @@ TEST(TransportSerialTest, UnsupportedLowLatencyStillConnects) {
   EXPECT_EQ(port_raw->low_latency_requests(), 1);
   EXPECT_TRUE(connected.load());
   EXPECT_FALSE(errored.load());
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -285,7 +275,7 @@ TEST(TransportSerialTest, RxIdleTimeoutReopensASilentPort) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.rx_idle_timeout_ms = 30;
-  cfg.retry_interval_ms = 20;
+  cfg.retry_interval_ms = 100;
   cfg.reopen_on_error = true;
 
   auto port = std::make_unique<FakeSerialPort>(ioc);
@@ -299,22 +289,23 @@ TEST(TransportSerialTest, RxIdleTimeoutReopensASilentPort) {
   });
 
   serial->start();
-  ioc.run_for(150ms);
+  // Timer resolution and scheduling can exceed the nominal 30 + 100 ms.
+  // Wait for the reopen itself, with a bounded failure deadline.
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (connects.load() < 2 && std::chrono::steady_clock::now() < deadline) {
+    if (ioc.stopped()) ioc.restart();
+    ioc.run_for(10ms);
+  }
 
   EXPECT_GE(connects.load(), 2) << "the silent port was closed but never reopened";
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
 TEST(TransportSerialTest, RxIdleTimeoutIsOffByDefault) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
-  cfg.retry_interval_ms = 20;
+  cfg.retry_interval_ms = 100;
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto serial = Serial::create(cfg, std::move(port), ioc);
 
@@ -327,12 +318,7 @@ TEST(TransportSerialTest, RxIdleTimeoutIsOffByDefault) {
   ioc.run_for(150ms);
 
   EXPECT_EQ(connects.load(), 1) << "a silent port was torn down with the watchdog disabled";
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -342,7 +328,7 @@ TEST(TransportSerialTest, ReceivedDataRearmsTheRxIdleTimeout) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.rx_idle_timeout_ms = 30;
-  cfg.retry_interval_ms = 20;
+  cfg.retry_interval_ms = 100;
 
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto* port_raw = port.get();
@@ -362,12 +348,7 @@ TEST(TransportSerialTest, ReceivedDataRearmsTheRxIdleTimeout) {
   }
 
   EXPECT_EQ(connects.load(), 1) << "a stream arriving every 10ms tripped a 30ms watchdog";
-  serial->stop();
-  // stop() only posts its cleanup when the io_context is external, and that
-  // handler owns a shared_ptr to the transport. Leaving it unrun keeps the
-  // transport alive until ~io_context destroys the handler - which runs
-  // perform_cleanup(), and so the state callback, after the locals it
-  // captures are gone. Drain here instead.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -395,7 +376,7 @@ TEST(TransportSerialTest, Rs485SettingsReachTheDriver) {
   EXPECT_TRUE(port_raw->rs485_rx_during_tx());
   EXPECT_EQ(port_raw->rs485_delay_before(), 2u);
   EXPECT_EQ(port_raw->rs485_delay_after(), 3u);
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -410,7 +391,7 @@ TEST(TransportSerialTest, Rs485IsNotRequestedUnlessEnabled) {
   ioc.run_for(20ms);
 
   EXPECT_EQ(port_raw->rs485_requests(), 0);
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -436,7 +417,7 @@ TEST(TransportSerialTest, UnsupportedRs485StillConnects) {
 
   EXPECT_EQ(port_raw->rs485_requests(), 1);
   EXPECT_TRUE(connected.load());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -453,7 +434,7 @@ TEST(TransportSerialTest, ModemLinesAreOnlyTouchedWhenSet) {
   ioc.run_for(20ms);
 
   EXPECT_EQ(port_raw->modem_requests(), 0) << "an unset line was still written";
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -473,7 +454,7 @@ TEST(TransportSerialTest, ModemLinesAreAppliedWhenSet) {
   ASSERT_TRUE(port_raw->modem_dtr().has_value());
   EXPECT_FALSE(*port_raw->modem_dtr());
   EXPECT_FALSE(port_raw->modem_rts().has_value()) << "RTS was written despite being unset";
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(50ms);
 }
 
@@ -481,7 +462,7 @@ TEST(TransportSerialTest, ModemLinesAreAppliedWhenSet) {
 TEST(TransportSerialTest, StopPreventsReopenAfterOperationAborted) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
-  cfg.retry_interval_ms = 20;
+  cfg.retry_interval_ms = 100;
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto* port_raw = port.get();
 
@@ -499,7 +480,7 @@ TEST(TransportSerialTest, StopPreventsReopenAfterOperationAborted) {
   ioc.run_for(5ms);  // allow open/configure and first read to post
 
   stop_called.store(true);
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
 
   // Simulate read completion with operation_aborted after stop
   port_raw->emit_operation_aborted();
@@ -522,6 +503,8 @@ TEST(TransportSerialTest, QueueLimitRejectsMessage) {
   });
 
   serial->start();
+  ioc.poll();
+  ASSERT_TRUE(serial->is_connected());
 
   // 5MB exceeds bp_limit (max(bp_high*4, 4MB) = 4MB)
   std::vector<uint8_t> huge(5 * 1024 * 1024, 0xEF);
@@ -530,7 +513,7 @@ TEST(TransportSerialTest, QueueLimitRejectsMessage) {
   ioc.run_for(50ms);
 
   EXPECT_FALSE(error_seen.load());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
@@ -565,7 +548,7 @@ TEST(TransportSerialTest, OpenAndConfigureFailuresMoveToError) {
     // #445: last_error_info() should now report detail for this transport too.
     ASSERT_TRUE(serial->last_error_info().has_value());
     EXPECT_EQ(serial->last_error_info()->component, "serial");
-    serial->stop();
+    wirestead::test::stop_with_context(serial, ioc);
     ioc.restart();
     ioc.run_for(5ms);
   }
@@ -585,6 +568,8 @@ TEST(TransportSerialTest, MoveWriteRespectsQueueLimit) {
   });
 
   serial->start();
+  ioc.poll();
+  ASSERT_TRUE(serial->is_connected());
 
   std::vector<uint8_t> huge(20 * 1024 * 1024, 0xCD);
   // Rejects synchronously when exceeding bp_limit
@@ -593,7 +578,7 @@ TEST(TransportSerialTest, MoveWriteRespectsQueueLimit) {
   ioc.run_for(50ms);
 
   EXPECT_FALSE(error_seen.load());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
@@ -611,6 +596,8 @@ TEST(TransportSerialTest, SharedWriteRespectsQueueLimit) {
   });
 
   serial->start();
+  ioc.poll();
+  ASSERT_TRUE(serial->is_connected());
 
   auto huge = std::make_shared<const std::vector<uint8_t>>(20 * 1024 * 1024, 0xAB);
   // Rejects synchronously when exceeding bp_limit
@@ -619,7 +606,7 @@ TEST(TransportSerialTest, SharedWriteRespectsQueueLimit) {
   ioc.run_for(50ms);
 
   EXPECT_FALSE(error_seen.load());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
@@ -627,7 +614,7 @@ TEST(TransportSerialTest, CallbackExceptionStopsWhenConfigured) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.stop_on_callback_exception = true;
-  cfg.retry_interval_ms = 10;
+  cfg.retry_interval_ms = 100;
 
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto* port_raw = port.get();
@@ -648,16 +635,17 @@ TEST(TransportSerialTest, CallbackExceptionStopsWhenConfigured) {
 
   ioc.run_for(20ms);
 
-  EXPECT_TRUE(error_seen.load());
-  serial->stop();
+  EXPECT_FALSE(error_seen.load());
+  EXPECT_FALSE(serial->is_connected());
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
-TEST(TransportSerialTest, CallbackExceptionRetriesWhenAllowed) {
+TEST(TransportSerialTest, CallbackExceptionContinuesReceivingByDefault) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.stop_on_callback_exception = false;
-  cfg.retry_interval_ms = 10;
+  cfg.retry_interval_ms = 100;
 
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto* port_raw = port.get();
@@ -677,20 +665,21 @@ TEST(TransportSerialTest, CallbackExceptionRetriesWhenAllowed) {
 
   port_raw->emit_read(4);
 
-  // Allow retry timer to fire at least once.
+  // A callback exception must not initiate a retry.
   ioc.run_for(40ms);
 
   EXPECT_EQ(error_events.load(), 0);
-  EXPECT_GE(connecting_events.load(), 2);  // initial start + retry attempt
-  serial->stop();
+  EXPECT_EQ(connecting_events.load(), 1);
+  EXPECT_TRUE(serial->is_connected());  // Only the initial start.
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
-TEST(TransportSerialTest, CallbackUnknownExceptionRetriesWhenAllowed) {
+TEST(TransportSerialTest, CallbackUnknownExceptionContinuesReceivingByDefault) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.stop_on_callback_exception = false;
-  cfg.retry_interval_ms = 10;
+  cfg.retry_interval_ms = 100;
 
   auto port = std::make_unique<FakeSerialPort>(ioc);
   auto* port_raw = port.get();
@@ -708,8 +697,9 @@ TEST(TransportSerialTest, CallbackUnknownExceptionRetriesWhenAllowed) {
   port_raw->emit_read(4);
   ioc.run_for(40ms);
 
-  EXPECT_GE(connecting_events.load(), 2);
-  serial->stop();
+  EXPECT_EQ(connecting_events.load(), 1);
+  EXPECT_TRUE(serial->is_connected());
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
@@ -735,11 +725,11 @@ TEST(TransportSerialTest, WriteErrorMovesToErrorWhenRetryDisabled) {
   ioc.run_for(30ms);
 
   EXPECT_TRUE(error_seen.load());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
-TEST(TransportSerialTest, BestEffortDropsOldestWhileWriteIsInFlight) {
+TEST(TransportSerialTest, BestEffortPreservesAcceptedWritesUnderPressure) {
   boost::asio::io_context ioc;
   config::SerialConfig cfg;
   cfg.backpressure_threshold = 1024;
@@ -766,8 +756,8 @@ TEST(TransportSerialTest, BestEffortDropsOldestWhileWriteIsInFlight) {
   EXPECT_TRUE(serial->is_backpressure_active());
   auto stats = serial->stats();
   EXPECT_EQ(stats.failed_sends, 0u);
-  EXPECT_EQ(stats.dropped_messages, 1u);
-  EXPECT_EQ(stats.dropped_bytes, payload.size());
+  EXPECT_EQ(stats.dropped_messages, 0u);
+  EXPECT_EQ(stats.dropped_bytes, 0u);
   serial->reset_stats();
   stats = serial->stats();
   EXPECT_EQ(stats.dropped_messages, 0u);
@@ -778,7 +768,7 @@ TEST(TransportSerialTest, BestEffortDropsOldestWhileWriteIsInFlight) {
   ioc.run_for(30ms);
 
   EXPECT_FALSE(bp_events.empty());
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
 
@@ -794,9 +784,11 @@ TEST(TransportSerialTest, BackpressureReliefAfterDrain) {
   serial->on_backpressure([&](size_t queued) { events.push_back(queued); });
 
   serial->start();
+  ioc.poll();
+  ASSERT_TRUE(serial->is_connected());
 
   std::vector<uint8_t> payload(cfg.backpressure_threshold * 2, 0x11);  // exceed high watermark, below limit
-  serial->async_write_copy(memory::ConstByteSpan(payload.data(), payload.size()));
+  ASSERT_TRUE(serial->async_write_copy(memory::ConstByteSpan(payload.data(), payload.size())));
 
   ioc.run_for(50ms);
 
@@ -804,6 +796,774 @@ TEST(TransportSerialTest, BackpressureReliefAfterDrain) {
   EXPECT_GE(events.front(), cfg.backpressure_threshold);
   EXPECT_LE(events.back(), cfg.backpressure_threshold / 2);
 
-  serial->stop();
+  wirestead::test::stop_with_context(serial, ioc);
   ioc.run_for(10ms);
 }
+
+namespace {
+// Delays old write completions across a reconnect and borrows the real gather
+// views, so ASan also checks the lifetime promised to port implementations.
+class DelayedSerialPort final : public interface::SerialPortInterface {
+ public:
+  using Handler = std::function<void(const boost::system::error_code&, size_t)>;
+  struct Write {
+    std::vector<boost::asio::const_buffer> views;
+    Handler handler;
+  };
+  boost::asio::io_context& io;
+  Handler read;
+  boost::asio::mutable_buffer read_buffer;
+  std::vector<std::pair<boost::asio::mutable_buffer, Handler>> retired_reads;
+  bool retain_reads = false;
+  unsigned opens = 0;
+  std::vector<Write> writes;
+  bool retain_writes = true;
+  explicit DelayedSerialPort(boost::asio::io_context& context) : io(context) {}
+  bool opened = false;
+  void open(const std::string&, boost::system::error_code& ec) override {
+    ++opens;
+    opened = true;
+    ec.clear();
+  }
+  bool is_open() const override { return opened; }
+  void set_option(const boost::asio::serial_port_base::baud_rate&, boost::system::error_code& ec) override {
+    ec.clear();
+  }
+  void set_option(const boost::asio::serial_port_base::character_size&, boost::system::error_code& ec) override {
+    ec.clear();
+  }
+  void set_option(const boost::asio::serial_port_base::stop_bits&, boost::system::error_code& ec) override {
+    ec.clear();
+  }
+  void set_option(const boost::asio::serial_port_base::parity&, boost::system::error_code& ec) override { ec.clear(); }
+  void set_option(const boost::asio::serial_port_base::flow_control&, boost::system::error_code& ec) override {
+    ec.clear();
+  }
+  void async_read_some(const boost::asio::mutable_buffer& buffer, Handler handler) override {
+    read_buffer = buffer;
+    read = std::move(handler);
+  }
+  void async_write(const boost::asio::const_buffer& buffer, Handler handler) override {
+    writes.push_back({{buffer}, std::move(handler)});
+  }
+  void async_write(const std::vector<boost::asio::const_buffer>& buffers, Handler handler) override {
+    writes.push_back({buffers, std::move(handler)});
+  }
+  void close(boost::system::error_code&) override {
+    opened = false;
+    if (auto handler = std::move(read)) {
+      if (retain_reads)
+        retired_reads.emplace_back(read_buffer, std::move(handler));
+      else
+        handler(boost::asio::error::operation_aborted, 0);
+    }
+    if (!retain_writes) {
+      for (auto& write : writes)
+        if (auto handler = std::move(write.handler)) handler(boost::asio::error::operation_aborted, 0);
+    }
+  }
+  std::string contents(size_t index) const {
+    std::string result;
+    for (auto view : writes.at(index).views) result.append(static_cast<const char*>(view.data()), view.size());
+    return result;
+  }
+  void complete(size_t index) {
+    const auto size = boost::asio::buffer_size(writes.at(index).views);
+    auto handler = std::move(writes.at(index).handler);
+    handler({}, size);
+  }
+};
+
+class SerialConnectionFenceTest : public ::testing::TestWithParam<int> {};
+TEST_P(SerialConnectionFenceTest, DropsQueuedAndPostedWritesAndKeepsOldBuffersAlive) {
+  boost::asio::io_context io;
+  config::SerialConfig cfg;
+
+  cfg.retry_interval_ms = 100;
+  cfg.enable_memory_pool = (GetParam() / 6) % 2 == 0;
+  cfg.backpressure_strategy = GetParam() >= 12 ? base::constants::BackpressureStrategy::BestEffort
+                                               : base::constants::BackpressureStrategy::Reliable;
+  auto socket = std::make_unique<DelayedSerialPort>(io);
+  auto* delayed = socket.get();
+  auto client = transport::Serial::create(cfg, std::move(socket), io);
+  struct Cleanup {
+    std::function<void()> action;
+    ~Cleanup() { action(); }
+  } cleanup{[&] {
+    delayed->retain_writes = false;
+    wirestead::test::stop_with_context(client, io);
+  }};
+  auto pump = [&] {
+    if (io.stopped()) io.restart();
+    io.run_for(std::chrono::milliseconds(20));
+  };
+  auto write = [&](std::string text) {
+    std::vector<uint8_t> payload(text.begin(), text.end());
+    switch (GetParam() % 6) {
+      case 0:
+        return client->async_write_copy(memory::ConstByteSpan(payload.data(), payload.size()));
+      case 1:
+        return client->async_write_move(std::move(payload));
+      case 2:
+        return client->async_write_shared(std::make_shared<const std::vector<uint8_t>>(payload));
+      case 3:
+        return client->async_try_write_copy(memory::ConstByteSpan(payload.data(), payload.size()));
+      case 4:
+        return client->async_try_write_move(std::move(payload));
+      default:
+        return client->async_try_write_shared(std::make_shared<const std::vector<uint8_t>>(payload));
+    }
+  };
+  client->start();
+  pump();
+  ASSERT_TRUE(client->is_connected());
+  ASSERT_TRUE(write("active-old"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 1u);
+  ASSERT_TRUE(write("queued-old"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 1u);
+  // Put loss ahead of an already accepted submission's strand handler.
+  boost::asio::post(client->get_executor(), [&] {
+    auto handler = std::move(delayed->read);
+    handler(boost::asio::error::connection_reset, 0);
+  });
+  ASSERT_TRUE(write("posted-old"));
+  pump();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!client->is_connected() && std::chrono::steady_clock::now() < deadline) pump();
+  ASSERT_TRUE(client->is_connected());
+  EXPECT_EQ(delayed->contents(0), "active-old");
+  EXPECT_EQ(client->stats().dropped_messages, 3u);
+  ASSERT_TRUE(write("new"));
+  pump();
+  ASSERT_EQ(delayed->writes.size(), 2u);
+  EXPECT_EQ(delayed->contents(1), "new");
+  const auto queued = client->stats().queued_bytes;
+  delayed->complete(0);
+  pump();
+  EXPECT_EQ(client->stats().queued_bytes, queued);
+  EXPECT_EQ(client->stats().bytes_sent, 0u);
+  delayed->complete(1);
+  pump();
+  EXPECT_EQ(client->stats().bytes_sent, 3u);
+  EXPECT_EQ(client->stats().queued_bytes, 0u);
+}
+INSTANTIATE_TEST_SUITE_P(FormsPoolAndStrategy, SerialConnectionFenceTest, ::testing::Range(0, 24));
+}  // namespace
+
+namespace {
+thread_local std::optional<wirestead::wrapper::SendResult> nonblocking_result;
+thread_local int nonblocking_observations = 0;
+void observe_nonblocking_result(const wirestead::wrapper::SendResult& result) {
+  nonblocking_result = result;
+  ++nonblocking_observations;
+}
+
+struct NonblockingResultPeer {
+  boost::asio::io_context io;
+  std::shared_ptr<wirestead::transport::Serial> native;
+  std::unique_ptr<wirestead::wrapper::Serial> client;
+  explicit NonblockingResultPeer(bool best_effort) {
+    wirestead::config::SerialConfig cfg;
+    cfg.backpressure_threshold = 1024;
+    cfg.backpressure_strategy = best_effort ? wirestead::base::constants::BackpressureStrategy::BestEffort
+                                            : wirestead::base::constants::BackpressureStrategy::Reliable;
+    native = wirestead::transport::Serial::create(cfg, std::make_unique<FakeSerialPort>(io), io);
+    client = std::make_unique<wirestead::wrapper::Serial>(native);
+    client->backpressure_strategy(cfg.backpressure_strategy);
+    wirestead::wrapper::detail::g_serial_send_result_hook.store(observe_nonblocking_result);
+  }
+  ~NonblockingResultPeer() {
+    wirestead::wrapper::detail::g_serial_send_result_hook.store(nullptr);
+    wirestead::test::stop_wrapper_with_context(*client, io);
+  }
+  template <typename Predicate>
+  bool until(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (io.stopped()) io.restart();
+      io.run_for(std::chrono::milliseconds(10));
+    }
+    return true;
+  }
+};
+
+class SerialNonblockingResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(SerialNonblockingResultTest, OrdersValidationLifecycleAndCapacityReasons) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  const bool best_effort = GetParam() >= 4 && GetParam() < 8;
+  const int form = GetParam() % 4;
+  // Explicit try methods must stay WouldBlock even on a BestEffort channel.
+  NonblockingResultPeer peer(GetParam() >= 4);
+  auto& client = *peer.client;
+  std::optional<wirestead::wrapper::SendResult> returned_result;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    auto accepted = wirestead::wrapper::SendResult::reject(wirestead::wrapper::SendRejection::NotReady);
+    if (form == 0) {
+      accepted = best_effort ? client.send(text) : client.try_send(text);
+    } else if (form == 1) {
+      accepted = best_effort ? client.send_line(text) : client.try_send_line(text);
+    } else if (form == 2) {
+      std::vector<uint8_t> payload(text.begin(), text.end());
+      accepted = best_effort ? client.send_move(std::move(payload)) : client.try_send_move(std::move(payload));
+      if (!accepted) {
+        EXPECT_EQ(std::string(payload.begin(), payload.end()), text);
+      }
+    } else {
+      auto payload = std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end());
+      accepted = best_effort ? client.send_shared(payload) : client.try_send_shared(payload);
+    }
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (nonblocking_result) {
+      EXPECT_EQ(nonblocking_result->accepted(), accepted.accepted());
+    }
+    returned_result = accepted;
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(returned_result.has_value());
+    ASSERT_FALSE(returned_result->accepted());
+    EXPECT_EQ(returned_result->reason(), expected);
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  if (form != 1) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  // Line delimiters count against the hard queue limit before state/capacity.
+  const std::string oversized(*peer.native->write_queue_limit() + (form == 1 ? 0 : 1), 'x');
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  EXPECT_EQ(peer.native->stats().failed_sends, 0u);
+
+  auto started = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  // Fill high-water without running the executor again.
+  ASSERT_TRUE(client.try_send(std::string(1024, 'f')));
+  EXPECT_FALSE(write("valid"));
+  reason(best_effort ? Rejection::QueueFull : Rejection::WouldBlock);
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+
+  bool stopped_on_executor = false;
+  boost::asio::post(peer.io, [&] {
+    client.stop();
+    EXPECT_FALSE(write("valid"));
+    reason(Rejection::Stopping);
+    EXPECT_FALSE(write(oversized));
+    reason(Rejection::TooLarge);
+    stopped_on_executor = true;
+  });
+  ASSERT_TRUE(peer.until([&] { return stopped_on_executor; }));
+  wirestead::test::stop_wrapper_with_context(client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  auto restarted = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(restarted.get());
+  EXPECT_TRUE(write("valid"));
+}
+
+INSTANTIATE_TEST_SUITE_P(TryAndBestEffortForms, SerialNonblockingResultTest, ::testing::Range(0, 12));
+
+TEST(SerialNonblockingResultContract, ConnectedNativeStillRequiresWrapperStart) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  NonblockingResultPeer peer(false);
+  peer.native->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  EXPECT_FALSE(peer.client->try_send("before wrapper start"));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), Rejection::NotStarted);
+  EXPECT_EQ(peer.native->stats().messages_accepted, 0u);
+  ASSERT_TRUE(peer.client->start().get());
+  EXPECT_TRUE(peer.client->try_send("after wrapper start"));
+}
+
+TEST(SerialNonblockingResultContract, NullSharedPayloadIsInvalidBeforeStartAndAfterStop) {
+  NonblockingResultPeer peer(true);
+  EXPECT_FALSE(peer.client->send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::InvalidArgument);
+  peer.client->stop();
+  EXPECT_FALSE(peer.client->try_send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::InvalidArgument);
+}
+
+class SerialReliableResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(SerialReliableResultTest, ValidatesBeforeStateAndPreservesPayload) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  // The last two cases exercise explicit blocking under BestEffort.
+  NonblockingResultPeer peer(GetParam() >= 6);
+  const int form = GetParam() >= 6 ? GetParam() - 4 : GetParam();
+  auto& client = *peer.client;
+  std::optional<wirestead::wrapper::SendResult> returned_result;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    auto accepted = wirestead::wrapper::SendResult::reject(wirestead::wrapper::SendRejection::NotReady);
+    if (form == 0)
+      accepted = client.send(text);
+    else if (form == 1)
+      accepted = client.send_line(text);
+    else if (form == 2)
+      accepted = client.send_blocking(text);
+    else if (form == 3)
+      accepted = client.send_line_blocking(text);
+    else if (form == 4) {
+      std::vector<uint8_t> payload(text.begin(), text.end());
+      accepted = client.send_move(std::move(payload));
+      if (!accepted) {
+        EXPECT_EQ(std::string(payload.begin(), payload.end()), text);
+      }
+    } else
+      accepted = client.send_shared(std::make_shared<const std::vector<uint8_t>>(text.begin(), text.end()));
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (nonblocking_result) {
+      EXPECT_EQ(nonblocking_result->accepted(), accepted.accepted());
+    }
+    returned_result = accepted;
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(returned_result.has_value());
+    ASSERT_FALSE(returned_result->accepted());
+    EXPECT_EQ(returned_result->reason(), expected);
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+  const bool line = form == 1 || form == 3;
+  const std::string oversized(*peer.native->write_queue_limit() + (line ? 0 : 1), 'x');
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  if (!line) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  EXPECT_EQ(peer.native->stats().failed_sends, 0u);
+  auto started = client.start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  {
+    wirestead::wrapper::detail::CallbackGuard guard;
+    EXPECT_TRUE(write("capacity available in callback"));
+  }
+  wirestead::test::stop_wrapper_with_context(client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  EXPECT_FALSE(write(oversized));
+  reason(Rejection::TooLarge);
+  EXPECT_FALSE(client.send_shared(nullptr));
+  ASSERT_TRUE(nonblocking_result.has_value());
+  EXPECT_EQ(nonblocking_result->reason(), Rejection::InvalidArgument);
+}
+INSTANTIATE_TEST_SUITE_P(ReliableAndExplicitBlocking, SerialReliableResultTest, ::testing::Range(0, 8));
+
+TEST(SerialReliableResultContract, NativeCapacityRetriesBeyondFiveAndStopReleasesSender) {
+  NonblockingResultPeer peer(false);
+  auto started = peer.client->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit(), 'f')));
+  const auto failures = peer.native->stats().failed_sends;
+  std::vector<uint8_t> payload{1, 2, 3};
+  auto sender = std::async(std::launch::async, [&] { return peer.client->send_move(std::move(payload)); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (peer.native->stats().failed_sends < failures + 12 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool retried = peer.native->stats().failed_sends >= failures + 12;
+  auto stopper = std::async(std::launch::async, [&] { peer.client->stop(); });
+  // Stop cancels the retained wait before waiting for native executor cleanup.
+  const bool released = sender.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(peer.until([&] { return stopper.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready; }));
+  stopper.get();
+  ASSERT_TRUE(released);
+  const auto result = sender.get();
+  EXPECT_TRUE(retried);
+  EXPECT_FALSE(result.accepted());
+  EXPECT_TRUE(result.reason() == wirestead::wrapper::SendRejection::CancelledWhileWaiting ||
+              result.reason() == wirestead::wrapper::SendRejection::Stopping);
+  EXPECT_EQ(payload, (std::vector<uint8_t>{1, 2, 3}));
+}
+
+TEST(SerialReliableResultContract, CallbackCapacityRefusalPreservesMoveStorage) {
+  NonblockingResultPeer peer(false);
+  auto started = peer.client->start();
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  // Keep the executor paused: inflight reservations fill the hard limit but
+  // have not yet published high-water pressure. Callback callers must not retry.
+  ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit(), 'f')));
+  ASSERT_FALSE(peer.native->is_backpressure_active());
+  wirestead::wrapper::detail::CallbackGuard callback_scope;
+  const auto failures = peer.native->stats().failed_sends;
+  for (int form = 0; form < 3; ++form) {
+    nonblocking_observations = 0;
+    std::vector<uint8_t> payload{1, 2, 3};
+    if (form == 0) {
+      EXPECT_FALSE(peer.client->send_blocking("copy"));
+    } else if (form == 1) {
+      EXPECT_FALSE(peer.client->send_move(std::move(payload)));
+      EXPECT_EQ(payload, (std::vector<uint8_t>{1, 2, 3}));
+    } else {
+      EXPECT_FALSE(peer.client->send_shared(std::make_shared<const std::vector<uint8_t>>(payload)));
+    }
+    ASSERT_TRUE(nonblocking_result.has_value());
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), wirestead::wrapper::SendRejection::WouldBlock);
+    EXPECT_EQ(peer.native->stats().failed_sends, failures + (form + 1));
+    EXPECT_EQ(peer.native->stats().messages_accepted, 1u);
+  }
+}
+}  // namespace
+
+namespace {
+class SerialNativeResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(SerialNativeResultTest, ReportsLifecycleValidationAndCapacityAtAdmission) {
+  using Rejection = wirestead::wrapper::SendRejection;
+  NonblockingResultPeer peer(GetParam() >= 6);
+  wirestead::transport::detail::g_serial_write_result_hook.store(observe_nonblocking_result);
+  struct ResetHook {
+    ~ResetHook() { wirestead::transport::detail::g_serial_write_result_hook.store(nullptr); }
+  } reset_hook;
+  auto write = [&](std::string_view text) {
+    nonblocking_result.reset();
+    nonblocking_observations = 0;
+    std::vector<uint8_t> data(text.begin(), text.end());
+    bool accepted;
+    switch (GetParam() % 6) {
+      case 0:
+        accepted = peer.native->async_write_copy({data.data(), data.size()});
+        break;
+      case 1:
+        accepted = peer.native->async_write_move(std::move(data));
+        break;
+      case 2:
+        accepted = peer.native->async_write_shared(std::make_shared<const std::vector<uint8_t>>(data));
+        break;
+      case 3:
+        accepted = peer.native->async_try_write_copy({data.data(), data.size()});
+        break;
+      case 4:
+        accepted = peer.native->async_try_write_move(std::move(data));
+        break;
+      default:
+        accepted = peer.native->async_try_write_shared(std::make_shared<const std::vector<uint8_t>>(data));
+        break;
+    }
+    EXPECT_EQ(nonblocking_observations, 1);
+    EXPECT_TRUE(nonblocking_result.has_value());
+    if (!accepted) {
+      EXPECT_EQ(std::string(data.begin(), data.end()), text);
+    }
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(nonblocking_result.has_value());
+    ASSERT_FALSE(nonblocking_result->accepted());
+    EXPECT_EQ(nonblocking_result->reason(), expected);
+  };
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  auto started = peer.client->start();
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotReady);
+  ASSERT_TRUE(peer.until([&] { return peer.native->is_connected(); }));
+  ASSERT_TRUE(started.get());
+  EXPECT_FALSE(write(""));
+  reason(Rejection::InvalidArgument);
+  EXPECT_TRUE(write("accepted"));
+  ASSERT_TRUE(nonblocking_result->accepted());
+  if (GetParam() % 6 < 3) {
+    ASSERT_TRUE(peer.native->async_write_move(std::vector<uint8_t>(*peer.native->write_queue_limit() - 8, 'f')));
+  } else {
+    ASSERT_TRUE(peer.native->async_try_write_move(std::vector<uint8_t>(1024 - 8, 'f')));
+  }
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::WouldBlock);
+  // Stop on the executor, while completion is still pending.
+  bool requested = false;
+  boost::asio::post(peer.io, [&] {
+    peer.native->stop();
+    EXPECT_FALSE(write("valid"));
+    reason(Rejection::Stopping);
+    requested = true;
+  });
+  ASSERT_TRUE(peer.until([&] { return requested; }));
+  wirestead::test::stop_wrapper_with_context(*peer.client, peer.io);
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+}
+INSTANTIATE_TEST_SUITE_P(FormsAndStrategies, SerialNativeResultTest, ::testing::Range(0, 12));
+}  // namespace
+
+namespace {
+class Signal {
+ public:
+  void notify() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    set_ = true;
+    cv_.notify_all();
+  }
+  bool wait(std::chrono::milliseconds limit = 5s) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, limit, [this] { return set_; });
+  }
+  void hold() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return set_; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool set_ = false;
+};
+
+struct OnExit {
+  std::function<void()> action;
+  ~OnExit() { action(); }
+};
+
+struct Context {
+  std::shared_ptr<boost::asio::io_context> io = std::make_shared<boost::asio::io_context>();
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work{io->get_executor()};
+  std::thread runner{[this] { io->run(); }};
+  ~Context() {
+    work.reset();
+    io->stop();
+    runner.join();
+  }
+};
+
+struct AdmissionPark {
+  Signal entered, release;
+  std::atomic<bool> armed{true};
+};
+std::atomic<AdmissionPark*> admission_park{nullptr};
+void park_admission() {
+  auto* park = admission_park.load();
+  if (park && park->armed.exchange(false)) {
+    park->entered.notify();
+    park->release.hold();
+  }
+}
+
+std::atomic<int> observed_send_result{-1};
+void observe_send_result(const wrapper::SendResult& result) {
+  observed_send_result = result.accepted() ? 100 : static_cast<int>(result.reason());
+}
+std::atomic<int> observed_wait_result{-1};
+std::atomic<AdmissionPark*> wait_result_park{nullptr};
+void observe_wait_result(const wrapper::SendResult& result) {
+  if (auto park = wait_result_park.load()) {
+    park->entered.notify();
+    park->release.hold();
+  }
+  observed_wait_result = result.accepted() ? 100 : static_cast<int>(result.reason());
+}
+
+class SerialCapacityWaitConnectionTest : public ::testing::TestWithParam<int> {};
+TEST_P(SerialCapacityWaitConnectionTest, PreservesWaitReleaseOutcome) {
+  Context context;
+  namespace net = boost::asio;
+  config::SerialConfig cfg;
+  cfg.backpressure_threshold = 1024;
+  cfg.retry_interval_ms = 100;
+  auto port = std::make_unique<FakeSerialPort>(*context.io);
+  auto* fake = port.get();
+  fake->set_complete_writes(false);
+  auto transport = transport::Serial::create(cfg, std::move(port), *context.io);
+  wrapper::Serial client(transport);
+  std::atomic<int> connections{0};
+  AdmissionPark park, result_park;
+  std::future<wirestead::wrapper::SendResult> writer;
+  OnExit cleanup{[&] {
+    park.release.notify();
+    result_park.release.notify();
+    client.stop();
+    if (writer.valid()) writer.wait();
+    wrapper::detail::g_serial_capacity_wait_hook.store(nullptr);
+    wrapper::detail::g_serial_capacity_wait_result_hook.store(nullptr);
+    wrapper::detail::g_serial_send_result_hook.store(nullptr);
+    wait_result_park.store(nullptr);
+    transport::detail::g_serial_pinned_write_hook.store(nullptr);
+    admission_park.store(nullptr);
+  }};
+  client.on_connect([&](const auto&) { ++connections; });
+  auto ready = client.start();
+  ASSERT_EQ(ready.wait_for(3s), std::future_status::ready);
+  ASSERT_TRUE(ready.get());
+  if (GetParam() < 12 || GetParam() >= 18) {
+    ASSERT_TRUE(transport->async_write_move(std::vector<uint8_t>(512 * 1024, 'x')));
+    ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return transport->is_backpressure_active(); }, 3000));
+  }
+  observed_wait_result = -1;
+  wrapper::detail::g_serial_capacity_wait_result_hook.store(&observe_wait_result);
+  if (GetParam() >= 30 && GetParam() < 36) wait_result_park.store(&result_park);
+  admission_park.store(&park);
+  if (GetParam() < 12 || GetParam() >= 18) {
+    wrapper::detail::g_serial_capacity_wait_hook.store(&park_admission);
+  } else {
+    transport::detail::g_serial_pinned_write_hook.store(&park_admission);
+  }
+  auto send = [&] {
+    switch (GetParam() % 6) {
+      case 0:
+        return client.send("old");
+      case 1:
+        return client.send_line("old");
+      case 2:
+        return client.send_blocking("old");
+      case 3:
+        return client.send_line_blocking("old");
+      case 4:
+        return client.send_move(std::vector<uint8_t>{1, 2, 3});
+      default:
+        return client.send_shared(std::make_shared<const std::vector<uint8_t>>(3, 42));
+    }
+  };
+  observed_send_result = -1;
+  wrapper::detail::g_serial_send_result_hook.store(&observe_send_result);
+  if (GetParam() >= 42) {
+    wrapper::detail::CallbackGuard guard;
+    EXPECT_FALSE(send());
+    EXPECT_EQ(observed_send_result, static_cast<int>(wrapper::SendRejection::WouldBlock));
+    EXPECT_EQ(observed_wait_result, -1);
+    return;
+  }
+  writer = std::async(std::launch::async, send);
+  ASSERT_TRUE(park.entered.wait());
+  if (GetParam() < 18) {
+    boost::asio::post(transport->get_executor(), [&] { fake->emit_read(0, boost::asio::error::connection_reset); });
+    if (GetParam() < 12) {
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return connections >= 2; }, 3000));
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return transport->is_connected(); }, 3000));
+    } else {
+      // Serial publishes Connecting before scheduling retry. The parked sender holds
+      // the wrapper read lock, so let it reject before completing that callback.
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return !transport->is_connected(); }, 3000));
+    }
+    if (GetParam() >= 6 && GetParam() < 12) {
+      ASSERT_TRUE(transport->async_write_move(std::vector<uint8_t>(512 * 1024, 'y')));
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return transport->is_backpressure_active(); }, 3000));
+    }
+  } else if (GetParam() < 24) {
+    // Prevent a replacement connection while proving loss-before-stop ordering.
+    boost::asio::post(transport->get_executor(), [&] {
+      fake->set_open_error(boost::asio::error::access_denied);
+      fake->emit_read(0, boost::asio::error::connection_reset);
+    });
+    ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return !transport->is_connected(); }, 3000));
+    client.stop();
+  } else if (GetParam() < 30) {
+    if (GetParam() % 2 == 0)
+      transport->stop();
+    else
+      client.stop();
+    boost::asio::post(transport->get_executor(), [&] { fake->emit_read(0, boost::asio::error::connection_reset); });
+  } else {
+    boost::asio::post(transport->get_executor(), [&] { fake->complete_pending_write(); });
+    ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return !transport->is_backpressure_active(); }, 3000));
+  }
+  const auto accepted_before = transport->stats().messages_accepted;
+  park.release.notify();
+  if (GetParam() >= 30 && GetParam() < 36) {
+    ASSERT_TRUE(result_park.entered.wait());
+    client.stop();
+    result_park.release.notify();
+  }
+  const auto status = writer.wait_for(300ms);
+  EXPECT_EQ(status, std::future_status::ready);
+  if (status != std::future_status::ready) client.stop();
+  const bool capacity_accepted = GetParam() >= 36;
+  const auto send_result = writer.get();
+  EXPECT_EQ(send_result.accepted(), capacity_accepted);
+  EXPECT_EQ(transport->stats().messages_accepted, accepted_before + (capacity_accepted ? 1 : 0));
+  const auto expected_send = capacity_accepted  ? 100
+                             : GetParam() >= 30 ? static_cast<int>(wrapper::SendRejection::NotStarted)
+                             : GetParam() >= 24 ? static_cast<int>(wrapper::SendRejection::CancelledWhileWaiting)
+                                                : static_cast<int>(wrapper::SendRejection::NotReady);
+  EXPECT_EQ(observed_send_result, expected_send);
+  EXPECT_EQ(send_result.accepted() ? 100 : static_cast<int>(send_result.reason()), expected_send);
+  if (GetParam() < 12 || (GetParam() >= 18 && GetParam() < 24)) {
+    EXPECT_EQ(observed_wait_result, static_cast<int>(wrapper::SendRejection::NotReady));
+  } else if (GetParam() >= 24 && GetParam() < 30) {
+    EXPECT_EQ(observed_wait_result, static_cast<int>(wrapper::SendRejection::CancelledWhileWaiting));
+  } else if (GetParam() >= 30) {
+    EXPECT_EQ(observed_wait_result, 100);
+  }
+  if (GetParam() < 6 || (GetParam() >= 12 && GetParam() < 18)) {
+    if (GetParam() >= 12) {
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return connections >= 2; }, 3000));
+      ASSERT_TRUE(test::TestUtils::waitForCondition([&] { return transport->is_connected(); }, 3000));
+    }
+    EXPECT_TRUE(client.send("new"));
+    EXPECT_EQ(transport->stats().messages_accepted, accepted_before + 1);
+  }
+}
+INSTANTIATE_TEST_SUITE_P(ReconnectAndReleaseReasons, SerialCapacityWaitConnectionTest, ::testing::Range(0, 48));
+}  // namespace
+
+namespace {
+TEST(SerialReadFenceTest, IdleReopenKeepsOldReadBufferAndIgnoresItsCompletion) {
+  boost::asio::io_context io;
+  config::SerialConfig cfg;
+  cfg.rx_idle_timeout_ms = 30;
+  cfg.retry_interval_ms = 100;
+  auto port = std::make_unique<DelayedSerialPort>(io);
+  auto* delayed = port.get();
+  delayed->retain_reads = true;
+  auto serial = transport::Serial::create(cfg, std::move(port), io);
+  OnExit cleanup{[&] {
+    delayed->retain_reads = false;
+    delayed->retain_writes = false;
+    delayed->retired_reads.clear();
+    test::stop_with_context(serial, io);
+  }};
+  int received = 0;
+  serial->on_bytes([&](memory::ConstByteSpan) { ++received; });
+  serial->start();
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (delayed->opens < 2 && std::chrono::steady_clock::now() < deadline) {
+    if (io.stopped()) io.restart();
+    io.run_one_for(5ms);
+  }
+  ASSERT_EQ(delayed->opens, 2u);
+  ASSERT_EQ(delayed->retired_reads.size(), 1u);
+  auto old = std::move(delayed->retired_reads.front());
+  delayed->retired_reads.clear();
+  ASSERT_NE(old.first.data(), delayed->read_buffer.data());
+  static_cast<uint8_t*>(old.first.data())[0] = 42;
+  old.second({}, 1);
+  old.second = {};
+  io.poll();
+  EXPECT_EQ(received, 0);
+  EXPECT_EQ(serial->stats().bytes_received, 0u);
+  EXPECT_TRUE(serial->is_connected());
+}
+}  // namespace
