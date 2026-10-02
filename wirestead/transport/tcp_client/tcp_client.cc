@@ -17,6 +17,9 @@
 #include "wirestead/transport/tcp_client/tcp_client.hpp"
 
 #include "wirestead/concurrency/io_thread_hook.hpp"
+#include "wirestead/config/validation.hpp"
+#include "wirestead/diagnostics/callback.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Wsign-conversion"
@@ -31,6 +34,7 @@
 #ifdef WIRESTEAD_TLS_ENABLED
 #include <boost/asio/ssl.hpp>
 #endif
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -57,11 +61,13 @@
 #include "wirestead/diagnostics/error_mapping.hpp"
 #include "wirestead/diagnostics/logger.hpp"
 #include "wirestead/diagnostics/runtime_stats_counter.hpp"
+#include "wirestead/diagnostics/send_accounting.hpp"
 #include "wirestead/memory/memory_pool.hpp"
 #include "wirestead/transport/base/bp_state_machine.hpp"
 #include "wirestead/transport/base/bp_utils.hpp"
 #include "wirestead/transport/base/error_info_holder.hpp"
 #include "wirestead/transport/tcp_client/detail/reconnect_decider.hpp"
+#include "wirestead/transport/tcp_client/detail/write_wait.hpp"
 
 namespace wirestead {
 namespace transport {
@@ -75,15 +81,33 @@ using config::TcpClientConfig;
 using interface::Channel;
 
 struct TcpClient::Impl {
+  using Ledger = diagnostics::SendAccountingLedger;
+  struct TrackedBuffer {
+    BufferVariant buffer;
+    Ledger::Request request;
+  };
+  struct BufferProjection {
+    template <typename T>
+    decltype(auto) operator()(T& item) const {
+      return (item.buffer);
+    }
+  };
+  Ledger send_accounting_;
   // Members moved from TcpClient
   std::shared_ptr<net::io_context> owned_ioc_;
   net::io_context* ioc_ = nullptr;
   net::strand<net::io_context::executor_type> strand_;
+  // Internal write lambdas have the default allocator and no associated executor.
+  // Cache post's properties once; never execute inline under submission_mtx_.
+  const net::strand<net::io_context::executor_type> write_executor_;
   std::unique_ptr<net::executor_work_guard<net::io_context::executor_type>> work_guard_;
   std::jthread ioc_thread_;
   std::atomic<uint64_t> lifecycle_seq_{0};
   std::atomic<uint64_t> stop_seq_{0};
   std::atomic<uint64_t> current_seq_{0};
+  // Changes when a usable connection ends, independently of start/stop runs.
+  std::atomic<uint64_t> connection_seq_{0};
+  std::shared_ptr<detail::TcpWriteWait> write_wait_;
   tcp::resolver resolver_;
   tcp::socket socket_;
 
@@ -132,24 +156,28 @@ struct TcpClient::Impl {
   net::steady_timer connect_timer_;
   net::steady_timer idle_timer_;
   bool owns_ioc_ = true;
+  // Orders caller-side write admission and strand submission before stop.
+  // Never run strand handlers/user callbacks while holding this mutex.
+  std::mutex submission_mtx_;
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> stopping_{false};
   std::atomic<bool> terminal_state_notified_{false};
   std::atomic<bool> reconnect_pending_{false};
 
-  // Sized from cfg_.read_buffer_size in init() rather than being a fixed
-  // std::array, so a bulk-transfer workload can trade memory for fewer read
-  // completions and callback dispatches.
-  std::vector<uint8_t> rx_;
-  std::deque<BufferVariant> tx_;
-  std::deque<BufferVariant> pending_;
+  // Per-connection storage, sized from cfg_.read_buffer_size. A cancelled
+  // read retains its buffer even if a replacement connection is ready.
+  std::shared_ptr<std::vector<uint8_t>> rx_;
+  std::deque<TrackedBuffer> tx_;
+  std::deque<TrackedBuffer> pending_;
   std::atomic<size_t> pending_bytes_{0};
-  // Buffers handed to the in-flight write. Several at a time rather than one:
-  // a backlog of queued messages used to cost one send syscall each. `views_`
-  // points into `current_write_batch_`, so both stay untouched for the whole
-  // async_write - `writing_` is what guarantees that.
-  std::vector<BufferVariant> current_write_batch_;
-  std::vector<net::const_buffer> current_write_views_;
+  // Each operation owns its buffers until its completion handler returns,
+  // even if a replacement connection has already started writing.
+  struct WriteBatch {
+    std::vector<TrackedBuffer> buffers;
+    std::vector<net::const_buffer> views;
+    size_t bytes = 0;
+  };
+  std::shared_ptr<WriteBatch> active_write_;
   bool writing_ = false;
   std::atomic<size_t> queue_bytes_{0};
   // Bytes accepted by a plain async_write_* call but not yet routed onto the
@@ -159,6 +187,67 @@ struct TcpClient::Impl {
   // reservation both go through write_reserve_mtx_ - see bp_utils.hpp.
   std::atomic<size_t> inflight_bytes_{0};
   std::mutex write_reserve_mtx_;
+  // D-1: shutdown *requested* and shutdown *completed* are separate states.
+  // The cleanup handler that runs on the strand is what completes it, and
+  // waiting callers wait for that signal rather than for a mutex - a mutex
+  // only says another caller was here, not that the teardown ran.
+  std::mutex stop_mtx_;
+  std::condition_variable stop_cv_;
+  bool cleanup_done_ = false;
+  std::atomic<bool> cleanup_started_{false};
+  // Strand-confined. Cancellation does not mean its completion handler has
+  // run; keep the run closed until those handlers have left the old buffers.
+  size_t pending_io_ = 0;
+  bool cleanup_finished_ = false;
+  struct IoCompletion {
+    Impl* impl;
+    ~IoCompletion() {
+      if (impl->cleanup_finished_ && impl->pending_io_ == 1) {
+        if (auto hook = detail::g_tcp_io_completion_hook.load()) hook();
+      }
+      if (--impl->pending_io_ == 0 && impl->cleanup_finished_) impl->mark_cleanup_done();
+    }
+  };
+
+  // Serializes the join itself: joining a thread from two callers is not
+  // allowed, and the second caller must not return before the first has.
+  std::mutex join_mtx_;
+
+  void mark_cleanup_done() {
+    detail::stop_test_hook(this, true);
+    {
+      std::lock_guard<std::mutex> lock(stop_mtx_);
+      cleanup_done_ = true;
+    }
+    stop_cv_.notify_all();
+  }
+
+  // Waits for the teardown that was posted to the strand. The contract's
+  // precondition for an externally run io_context is that the caller keeps it
+  // running, so this waits and nothing more: running the caller's executor
+  // here would execute other channels' handlers on the stopping thread.
+  void wait_for_cleanup() {
+    detail::stop_test_hook(this, false);
+    std::unique_lock<std::mutex> lock(stop_mtx_);
+    stop_cv_.wait(lock, [this] { return cleanup_done_; });
+  }
+
+  // Called with submission_mtx_ held. Explicit stop and readiness publication
+  // use that mutex; cleanup completion has its own condition-variable mutex.
+  std::optional<wrapper::SendRejection> admission_rejection(
+      std::optional<uint64_t> expected_connection = std::nullopt) {
+    if (stop_requested_.load()) {
+      std::lock_guard<std::mutex> lock(stop_mtx_);
+      return cleanup_done_ ? wrapper::SendRejection::NotStarted : wrapper::SendRejection::Stopping;
+    }
+    if (current_seq_.load() == 0) return wrapper::SendRejection::NotStarted;
+    if ((expected_connection && *expected_connection != connection_seq_.load()) || state_.is_state(LinkState::Closed) ||
+        state_.is_state(LinkState::Error) || !ioc_ || !connected_.load()) {
+      return wrapper::SendRejection::NotReady;
+    }
+    return std::nullopt;
+  }
+
   // Atomic rather than mutex-guarded: read both from the strand and from
   // arbitrary caller threads (async_try_write_* fast-fail prechecks) (#436).
   std::atomic<base::constants::BackpressureStrategy> bp_strategy_{base::constants::BackpressureStrategy::Reliable};
@@ -188,6 +277,9 @@ struct TcpClient::Impl {
       : owned_ioc_(ioc_ptr ? nullptr : std::make_shared<net::io_context>()),
         ioc_(ioc_ptr ? ioc_ptr : owned_ioc_.get()),
         strand_(net::make_strand(*ioc_)),
+        write_executor_(net::prefer(net::require(strand_, net::execution::blocking.never),
+                                    net::execution::relationship.fork,
+                                    net::execution::allocator(std::allocator<void>{}))),
         resolver_(strand_),
         socket_(strand_),
         cfg_(cfg),
@@ -200,13 +292,29 @@ struct TcpClient::Impl {
     init();
   }
 
+  void mark_disconnected() {
+    std::lock_guard<std::mutex> lock(submission_mtx_);
+    mark_disconnected_locked();
+  }
+
+  // Admission, write completion and explicit stop use the same terminal boundary.
+  void mark_disconnected_locked() {
+    if (connected_.exchange(false)) {
+      send_accounting_.end(Ledger::Cause::ConnectionLoss);
+      if (write_wait_) write_wait_->end(wrapper::SendRejection::NotReady);
+      connection_seq_.fetch_add(1);
+    }
+  }
+
+  void discard_connection_writes();
+
   void init() {
     connected_ = false;
     writing_ = false;
     queue_bytes_ = 0;
     pending_bytes_ = 0;
-    cfg_.validate_and_clamp();
-    rx_.resize(cfg_.read_buffer_size);
+    config::detail::validate(cfg_);
+    rx_ = std::make_shared<std::vector<uint8_t>>(cfg_.read_buffer_size);
     recalculate_backpressure_bounds();
     first_retry_interval_ms_ = std::min(first_retry_interval_ms_, cfg_.retry_interval_ms);
   }
@@ -226,11 +334,8 @@ struct TcpClient::Impl {
   void report_backpressure(std::shared_ptr<TcpClient> self, size_t queued_bytes);
   void observe_queue();
   // Shared decide_enqueue()/route dispatch used by all 3 async_write_* variants (#434).
-  // `reserved` tells this whether the caller reserved `added` bytes into
-  // inflight_bytes_ via try_reserve_limit_bytes() - only Reliable-strategy
-  // sends do (jwsung91/wirestead#517); BestEffort's plain path has no
-  // precheck and relies entirely on decide_enqueue()'s own keep-latest trim.
-  void route_enqueued_buffer(std::shared_ptr<TcpClient> self, BufferVariant&& buf, size_t added, bool reserved);
+  // Every caller reserves added bytes in inflight_bytes_ before posting.
+  void route_enqueued_buffer(std::shared_ptr<TcpClient> self, TrackedBuffer&& buf, size_t added);
   queue_util::BackpressureFields bp_fields();
   void notify_state();
   void reset_io_objects();
@@ -300,6 +405,7 @@ void TcpClient::start() {
 
   const auto seq = impl_->lifecycle_seq_.fetch_add(1) + 1;
   impl_->current_seq_.store(seq);
+  impl_->reset_start_state();
 
   if (impl_->owns_ioc_ && impl_->ioc_) {
     impl_->work_guard_ =
@@ -324,8 +430,7 @@ void TcpClient::start() {
         if (seq <= self->impl_->stop_seq_.load()) {
           return;
         }
-        self->impl_->reset_start_state();
-        self->impl_->connected_.store(false);
+        self->impl_->mark_disconnected();
         self->impl_->reset_io_objects();
         self->impl_->transition_to(LinkState::Connecting);
         self->impl_->do_resolve_connect(self, seq);
@@ -337,64 +442,132 @@ void TcpClient::start() {
 }
 
 void TcpClient::stop() {
-  if (impl_->stop_requested_.exchange(true)) {
-    return;
+  const bool on_executor = impl_->ioc_->get_executor().running_in_this_thread();
+  bool first;
+  {
+    std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+    first = !impl_->stop_requested_.exchange(true);
+    if (first) {
+      impl_->send_accounting_.end(Impl::Ledger::Cause::ExplicitStop);
+      if (impl_->write_wait_) impl_->write_wait_->end(wrapper::SendRejection::CancelledWhileWaiting);
+      impl_->stopping_.store(true);
+      impl_->stop_seq_.store(impl_->current_seq_.load());
+    }
   }
-
-  impl_->stopping_.store(true);
-  impl_->stop_seq_.store(impl_->current_seq_.load());
-  if (!impl_->ioc_) {
-    return;
+  if (first) {
+    // Only a never-started transport has no executor work to serialize with.
+    if (impl_->current_seq_.load() == 0) {
+      impl_->perform_stop_cleanup();
+    } else {
+      // A waiting destructor keeps Impl alive until this handler completes.
+      // Ordinary requests retain the transport across request-only returns.
+      auto self = weak_from_this().lock();
+      auto* impl = impl_.get();
+      net::post(impl_->strand_, [self, impl] { impl->perform_stop_cleanup(); });
+    }
   }
+  if (on_executor) return;
 
-  // Post via a raw Impl* rather than weak_from_this().lock(): when stop()
-  // runs from ~TcpClient(), the shared_ptr use count is already 0, so that
-  // lock() is guaranteed null (standard shared_ptr/enable_shared_from_this
-  // behavior during destruction) and perform_stop_cleanup() - which resets
-  // work_guard_ - would never be posted, leaving join_ioc_thread() below
-  // blocked forever with no work_guard reset to let io_context::run()
-  // return. impl_ itself stays alive until after join_ioc_thread() returns
-  // (~TcpClient() doesn't destroy it until its body finishes), so capturing
-  // the raw Impl* is safe in both the destructor and non-destructor paths.
-  Impl* impl_ptr = impl_.get();
-  net::post(impl_->strand_, [impl_ptr]() { impl_ptr->perform_stop_cleanup(); });
-
+  // External executors must keep progressing, as required by D-1. Never
+  // poll them here or infer completion from stopped()/elapsed time.
+  impl_->wait_for_cleanup();
+  std::lock_guard<std::mutex> join_lock(impl_->join_mtx_);
   impl_->join_ioc_thread(false);
 }
 
 bool TcpClient::is_connected() const { return get_impl()->connected_.load(); }
 bool TcpClient::is_backpressure_active() const { return get_impl()->backpressure_active_.load(); }
+std::optional<size_t> TcpClient::write_queue_limit() const { return impl_->bp_limit_; }
 wrapper::RuntimeStats TcpClient::stats() const {
-  return impl_->stats_.snapshot(impl_->queue_bytes_.load(std::memory_order_relaxed),
-                                impl_->pending_bytes_.load(std::memory_order_relaxed),
-                                impl_->backpressure_active_.load(std::memory_order_relaxed));
+  auto result = impl_->stats_.snapshot(impl_->queue_bytes_.load(std::memory_order_relaxed),
+                                       impl_->pending_bytes_.load(std::memory_order_relaxed),
+                                       impl_->backpressure_active_.load(std::memory_order_relaxed));
+  result.send_accounting = impl_->send_accounting_.snapshot();
+  return result;
 }
 void TcpClient::reset_stats() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  impl_->send_accounting_.reset();
   impl_->stats_.reset(impl_->queue_bytes_.load(std::memory_order_relaxed) +
                       impl_->pending_bytes_.load(std::memory_order_relaxed));
 }
 
+void TcpClient::fail_receive() {
+  const auto connection = write_connection();
+  if (!connection) return;
+  const auto run = impl_->current_seq_.load();
+  net::dispatch(impl_->strand_, [self = shared_from_this(), connection, run] {
+    if (run != self->impl_->current_seq_.load() || self->write_connection() != connection) return;
+    self->impl_->handle_close(self, run, make_error_code(boost::system::errc::no_buffer_space));
+  });
+}
+
 boost::asio::any_io_executor TcpClient::get_executor() { return impl_->socket_.get_executor(); }
 
-bool TcpClient::async_write_copy(memory::ConstByteSpan data) {
-  if (impl_->stop_requested_.load() || impl_->state_.is_state(LinkState::Closed) ||
-      impl_->state_.is_state(LinkState::Error) || !impl_->ioc_) {
-    impl_->stats_.record_failed_send();
-    return false;
+std::shared_ptr<detail::TcpWriteWait> TcpClient::capture_write_wait() const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->stop_requested_.load() || !impl_->connected_.load()) return {};
+  return impl_->write_wait_;
+}
+
+std::optional<wrapper::SendResult> TcpClient::poll_write_wait(const std::shared_ptr<detail::TcpWriteWait>& wait) const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (!wait) return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  if (wait->ended_by) return wrapper::SendResult::reject(*wait->ended_by);
+  if (wait->sequence != impl_->connection_seq_.load() || !impl_->connected_.load())
+    return wrapper::SendResult::reject(wrapper::SendRejection::NotReady);
+  if (!impl_->backpressure_active_.load()) return wrapper::SendResult::accept();
+  return std::nullopt;
+}
+
+void TcpClient::cancel_write_waits() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->write_wait_) impl_->write_wait_->end(wrapper::SendRejection::CancelledWhileWaiting);
+}
+
+std::optional<uint64_t> TcpClient::write_connection() const {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (impl_->stop_requested_.load() || !impl_->connected_.load()) return std::nullopt;
+  return impl_->connection_seq_.load();
+}
+
+wrapper::SendResult TcpClient::write_state() {
+  std::lock_guard<std::mutex> lock(impl_->submission_mtx_);
+  if (auto reason = impl_->admission_rejection()) return wrapper::SendResult::reject(*reason);
+  return wrapper::SendResult::accept();
+}
+
+wrapper::SendResult TcpClient::async_write_copy_result(memory::ConstByteSpan data) {
+  const auto result = write_copy(data, std::nullopt);
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_tcp_pinned_write_hook.load()) hook();
   }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_tcp_write_admission_hook.load()) hook();
 
   size_t size = data.size();
   if (size == 0) {
     WIRESTEAD_LOG_WARNING("tcp_client", "async_write_copy", "Ignoring zero-length write");
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
 
   if (size > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_client", "async_write_copy",
                         fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
 
   if (size <= 65536 && impl_->cfg_.enable_memory_pool) {
@@ -403,19 +576,28 @@ bool TcpClient::async_write_copy(memory::ConstByteSpan data) {
       if (pooled_buffer.valid()) {
         base::safe_memory::safe_memcpy(pooled_buffer.data(), data.data(), size);
         const auto added = pooled_buffer.size();
-        const bool reliable = impl_->bp_strategy_ == base::constants::BackpressureStrategy::Reliable;
-        if (reliable &&
-            !queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+
+        if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
                                                  impl_->inflight_bytes_, added, impl_->bp_limit_)) {
           impl_->stats_.record_failed_send();
-          return false;
+          return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
         }
         impl_->stats_.record_accepted(added);
-        net::dispatch(impl_->strand_,
-                      [self = shared_from_this(), buf = std::move(pooled_buffer), added, reliable]() mutable {
-                        self->impl_->route_enqueued_buffer(self, BufferVariant{std::move(buf)}, added, reliable);
-                      });
-        return true;
+        Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+        const auto request = admission.request();
+        impl_->write_executor_.execute([self = shared_from_this(), buf = std::move(pooled_buffer), added, seq,
+                                        connection, request]() mutable {
+          if (seq != self->impl_->current_seq_.load()) return;
+          if (connection != self->impl_->connection_seq_.load()) {
+            self->impl_->stats_.record_dropped(1, added);
+            queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_,
+                                                     added);
+            return;
+          }
+          self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
+        });
+        admission.commit();
+        return wrapper::SendResult::accept();
       }
     } catch (const std::exception& e) {
       WIRESTEAD_LOG_ERROR("tcp_client", "async_write_copy",
@@ -425,111 +607,179 @@ bool TcpClient::async_write_copy(memory::ConstByteSpan data) {
 
   std::vector<uint8_t> fallback(data.begin(), data.end());
   const auto added = fallback.size();
-  const bool reliable = impl_->bp_strategy_ == base::constants::BackpressureStrategy::Reliable;
-  if (reliable &&
-      !queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
                                            impl_->inflight_bytes_, added, impl_->bp_limit_)) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
 
-  net::dispatch(impl_->strand_, [self = shared_from_this(), buf = std::move(fallback), added, reliable]() mutable {
-    self->impl_->route_enqueued_buffer(self, BufferVariant{std::move(buf)}, added, reliable);
+  impl_->write_executor_.execute([self = shared_from_this(), buf = std::move(fallback), added, seq, connection,
+                                  request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
   });
-  return true;
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
-bool TcpClient::async_write_move(std::vector<uint8_t>&& data) {
-  if (impl_->stop_requested_.load() || impl_->state_.is_state(LinkState::Closed) ||
-      impl_->state_.is_state(LinkState::Error) || !impl_->ioc_) {
-    impl_->stats_.record_failed_send();
-    return false;
+wrapper::SendResult TcpClient::async_write_move_result(std::vector<uint8_t>&& data) {
+  const auto result = write_move(std::move(data), std::nullopt);
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_tcp_pinned_write_hook.load()) hook();
   }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_tcp_write_admission_hook.load()) hook();
   const auto size = data.size();
   if (size == 0) {
     WIRESTEAD_LOG_WARNING("tcp_client", "async_write_move", "Ignoring zero-length write");
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   if (size > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_client", "async_write_move",
                         fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
 
   const auto added = size;
-  const bool reliable = impl_->bp_strategy_ == base::constants::BackpressureStrategy::Reliable;
-  if (reliable &&
-      !queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
                                            impl_->inflight_bytes_, added, impl_->bp_limit_)) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
-  net::dispatch(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added, reliable]() mutable {
-    self->impl_->route_enqueued_buffer(self, BufferVariant{std::move(buf)}, added, reliable);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
+  impl_->write_executor_.execute([self = shared_from_this(), buf = std::move(data), added, seq, connection,
+                                  request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
   });
-  return true;
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
-bool TcpClient::async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-  if (impl_->stop_requested_.load() || impl_->state_.is_state(LinkState::Closed) ||
-      impl_->state_.is_state(LinkState::Error) || !impl_->ioc_) {
-    impl_->stats_.record_failed_send();
-    return false;
+wrapper::SendResult TcpClient::async_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) {
+  const auto result = write_shared(std::move(data), std::nullopt);
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                            std::optional<uint64_t> expected_connection) {
+  if (expected_connection) {
+    if (auto hook = detail::g_tcp_pinned_write_hook.load()) hook();
   }
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection(expected_connection)) {
+    impl_->stats_.record_failed_send();
+    return wrapper::SendResult::reject(*reason);
+  }
+  if (auto hook = detail::g_tcp_write_admission_hook.load()) hook();
   if (!data || data->empty()) {
     WIRESTEAD_LOG_WARNING("tcp_client", "async_write_shared", "Ignoring empty shared buffer");
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   const auto size = data->size();
   if (size > base::constants::MAX_BUFFER_SIZE) {
     WIRESTEAD_LOG_ERROR("tcp_client", "async_write_shared",
                         fmt::format("Write size exceeds maximum allowed ({} bytes)", size));
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
 
   const auto added = size;
-  const bool reliable = impl_->bp_strategy_ == base::constants::BackpressureStrategy::Reliable;
-  if (reliable &&
-      !queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
+
+  if (!queue_util::try_reserve_limit_bytes(impl_->write_reserve_mtx_, impl_->queue_bytes_, impl_->pending_bytes_,
                                            impl_->inflight_bytes_, added, impl_->bp_limit_)) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
-  net::dispatch(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added, reliable]() mutable {
-    self->impl_->route_enqueued_buffer(self, BufferVariant{std::move(buf)}, added, reliable);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
+  impl_->write_executor_.execute([self = shared_from_this(), buf = std::move(data), added, seq, connection,
+                                  request]() mutable {
+    if (seq != self->impl_->current_seq_.load()) return;
+    if (connection != self->impl_->connection_seq_.load()) {
+      self->impl_->stats_.record_dropped(1, added);
+      queue_util::release_reserved_limit_bytes(self->impl_->write_reserve_mtx_, self->impl_->inflight_bytes_, added);
+      return;
+    }
+    self->impl_->route_enqueued_buffer(self, Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request}, added);
   });
-  return true;
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
-bool TcpClient::async_try_write_copy(memory::ConstByteSpan data) {
+wrapper::SendResult TcpClient::async_try_write_copy_result(memory::ConstByteSpan data) {
+  const auto result = try_write_copy(data);
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::try_write_copy(memory::ConstByteSpan data) {
   if (data.empty()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   if (data.size() > base::constants::MAX_BUFFER_SIZE) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
-  return async_try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
+  return try_write_move(std::vector<uint8_t>(data.begin(), data.end()));
 }
 
-bool TcpClient::async_try_write_move(std::vector<uint8_t>&& data) {
-  if (impl_->stop_requested_.load() || impl_->state_.is_state(LinkState::Closed) ||
-      impl_->state_.is_state(LinkState::Error) || !impl_->ioc_) {
+wrapper::SendResult TcpClient::async_try_write_move_result(std::vector<uint8_t>&& data) {
+  const auto result = try_write_move(std::move(data));
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::try_write_move(std::vector<uint8_t>&& data) {
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
+  if (auto reason = impl_->admission_rejection()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(*reason);
   }
+  if (auto hook = detail::g_tcp_write_admission_hook.load()) hook();
   const auto added = data.size();
   if (added == 0 || added > base::constants::MAX_BUFFER_SIZE) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(added == 0 ? wrapper::SendRejection::InvalidArgument
+                                                  : wrapper::SendRejection::TooLarge);
   }
   const auto reject_for_pressure = [this, added]() {
     if (impl_->bp_strategy_ == base::constants::BackpressureStrategy::BestEffort) {
@@ -541,40 +791,60 @@ bool TcpClient::async_try_write_move(std::vector<uint8_t>&& data) {
   if (impl_->backpressure_active_.load() || impl_->queue_bytes_ + added > impl_->bp_high_ ||
       impl_->queue_bytes_ + impl_->pending_bytes_ + added > impl_->bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(impl_->queue_bytes_, impl_->pending_bytes_, impl_->backpressure_active_,
-                                           added, impl_->bp_high_, impl_->bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(impl_->write_reserve_mtx_, impl_->inflight_bytes_, impl_->queue_bytes_,
+                                           impl_->pending_bytes_, impl_->backpressure_active_, added, impl_->bp_high_,
+                                           impl_->bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
 
-  net::dispatch(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    auto impl = self->impl_.get();
-    if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
-        impl->state_.is_state(LinkState::Error)) {
-      queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
-      impl->stats_.record_failed_send();
-      return;
-    }
+  impl_->write_executor_.execute(
+      [self = shared_from_this(), buf = std::move(data), added, seq, connection, request]() mutable {
+        if (seq != self->impl_->current_seq_.load()) return;
+        if (connection != self->impl_->connection_seq_.load()) {
+          self->impl_->stats_.record_dropped(1, added);
+          // The old connection drain already removed this queue reservation.
+          return;
+        }
+        auto impl = self->impl_.get();
+        if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
+            impl->state_.is_state(LinkState::Error)) {
+          queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
+          impl->stats_.record_failed_send();
+          return;
+        }
 
-    impl->tx_.emplace_back(std::move(buf));
-    impl->observe_queue();
-    impl->report_backpressure(self, impl->queue_bytes_);
-    if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
-  });
-  return true;
+        impl->tx_.push_back(Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request});
+        impl->observe_queue();
+        impl->report_backpressure(self, impl->queue_bytes_);
+        if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
+      });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
-bool TcpClient::async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+wrapper::SendResult TcpClient::async_try_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) {
+  const auto result = try_write_shared(std::move(data));
+  if (auto hook = detail::g_tcp_write_result_hook.load()) hook(result);
+  return result;
+}
+
+wrapper::SendResult TcpClient::try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+  std::lock_guard<std::mutex> submission_lock(impl_->submission_mtx_);
+  const auto seq = impl_->current_seq_.load();
+  const auto connection = impl_->connection_seq_.load();
   if (!data || data->empty()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::InvalidArgument);
   }
   if (data->size() > base::constants::MAX_BUFFER_SIZE) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::TooLarge);
   }
   const auto added = data->size();
   const auto reject_for_pressure = [this, added]() {
@@ -584,38 +854,49 @@ bool TcpClient::async_try_write_shared(std::shared_ptr<const std::vector<uint8_t
       impl_->stats_.record_failed_send();
     }
   };
-  if (impl_->stop_requested_.load() || impl_->state_.is_state(LinkState::Closed) ||
-      impl_->state_.is_state(LinkState::Error) || !impl_->ioc_) {
+  if (auto reason = impl_->admission_rejection()) {
     impl_->stats_.record_failed_send();
-    return false;
+    return wrapper::SendResult::reject(*reason);
   }
+  if (auto hook = detail::g_tcp_write_admission_hook.load()) hook();
   if (impl_->backpressure_active_.load() || impl_->queue_bytes_ + added > impl_->bp_high_ ||
       impl_->queue_bytes_ + impl_->pending_bytes_ + added > impl_->bp_limit_) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
-  if (!queue_util::try_reserve_write_bytes(impl_->queue_bytes_, impl_->pending_bytes_, impl_->backpressure_active_,
-                                           added, impl_->bp_high_, impl_->bp_limit_)) {
+  if (!queue_util::try_reserve_write_bytes(impl_->write_reserve_mtx_, impl_->inflight_bytes_, impl_->queue_bytes_,
+                                           impl_->pending_bytes_, impl_->backpressure_active_, added, impl_->bp_high_,
+                                           impl_->bp_limit_)) {
     reject_for_pressure();
-    return false;
+    return wrapper::SendResult::reject(wrapper::SendRejection::WouldBlock);
   }
   impl_->stats_.record_accepted(added);
+  Impl::Ledger::Admission admission(impl_->send_accounting_, added);
+  const auto request = admission.request();
 
-  net::dispatch(impl_->strand_, [self = shared_from_this(), buf = std::move(data), added]() mutable {
-    auto impl = self->impl_.get();
-    if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
-        impl->state_.is_state(LinkState::Error)) {
-      queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
-      impl->stats_.record_failed_send();
-      return;
-    }
+  impl_->write_executor_.execute(
+      [self = shared_from_this(), buf = std::move(data), added, seq, connection, request]() mutable {
+        if (seq != self->impl_->current_seq_.load()) return;
+        if (connection != self->impl_->connection_seq_.load()) {
+          self->impl_->stats_.record_dropped(1, added);
+          // The old connection drain already removed this queue reservation.
+          return;
+        }
+        auto impl = self->impl_.get();
+        if (impl->stop_requested_.load() || impl->state_.is_state(LinkState::Closed) ||
+            impl->state_.is_state(LinkState::Error)) {
+          queue_util::release_reserved_write_bytes(impl->queue_bytes_, added);
+          impl->stats_.record_failed_send();
+          return;
+        }
 
-    impl->tx_.emplace_back(std::move(buf));
-    impl->observe_queue();
-    impl->report_backpressure(self, impl->queue_bytes_);
-    if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
-  });
-  return true;
+        impl->tx_.push_back(Impl::TrackedBuffer{BufferVariant{std::move(buf)}, request});
+        impl->observe_queue();
+        impl->report_backpressure(self, impl->queue_bytes_);
+        if (!impl->writing_) impl->do_write(self, impl->current_seq_.load());
+      });
+  admission.commit();
+  return wrapper::SendResult::accept();
 }
 
 // Each setter builds the shared snapshot before taking the lock, so the
@@ -636,30 +917,41 @@ void TcpClient::on_backpressure(OnBackpressure cb) {
   impl_->on_bp_ = std::move(shared);
 }
 void TcpClient::set_backpressure_strategy(base::constants::BackpressureStrategy strategy) {
+  config::detail::strategy(strategy);
   impl_->bp_strategy_.store(strategy, std::memory_order_relaxed);
 }
 
 void TcpClient::set_retry_interval(unsigned interval_ms) {
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
+  auto candidate = impl_->cfg_;
+  candidate.retry_interval_ms = interval_ms;
+  config::detail::validate(candidate);
   impl_->cfg_.retry_interval_ms = interval_ms;
-  impl_->cfg_.validate_and_clamp();
 }
 void TcpClient::set_max_retries(int max_retries) {
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
+  auto candidate = impl_->cfg_;
+  candidate.max_retries = max_retries;
+  config::detail::validate(candidate);
   impl_->cfg_.max_retries = max_retries;
-  impl_->cfg_.validate_and_clamp();
 }
 void TcpClient::set_connection_timeout(unsigned timeout_ms) {
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
+  auto candidate = impl_->cfg_;
+  candidate.connection_timeout_ms = timeout_ms;
+  config::detail::validate(candidate);
   impl_->cfg_.connection_timeout_ms = timeout_ms;
-  impl_->cfg_.validate_and_clamp();
 }
 void TcpClient::set_idle_timeout(unsigned timeout_ms) {
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
+  auto candidate = impl_->cfg_;
+  candidate.idle_timeout_ms = timeout_ms;
+  config::detail::validate(candidate);
   impl_->cfg_.idle_timeout_ms = timeout_ms;
-  impl_->cfg_.validate_and_clamp();
 }
 void TcpClient::set_idle_timeout_action(IdleTimeoutAction action) {
+  config::detail::require(action == IdleTimeoutAction::Close || action == IdleTimeoutAction::Reconnect,
+                          "invalid idle timeout action");
   std::lock_guard<std::mutex> lock(impl_->cfg_mtx_);
   impl_->cfg_.idle_timeout_action = action;
 }
@@ -713,8 +1005,10 @@ void TcpClient::Impl::apply_socket_options() {
 }
 
 void TcpClient::Impl::do_resolve_connect(std::shared_ptr<TcpClient> self, uint64_t seq) {
+  ++pending_io_;
   resolver_.async_resolve(
       cfg_.host, fmt::format("{}", cfg_.port), [self, seq](auto ec, tcp::resolver::results_type results) {
+        IoCompletion completion{self->impl_.get()};
         if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
           return;
         }
@@ -741,7 +1035,9 @@ void TcpClient::Impl::do_resolve_connect(std::shared_ptr<TcpClient> self, uint64
           connection_timeout_ms = self->impl_->cfg_.connection_timeout_ms;
         }
         self->impl_->connect_timer_.expires_after(std::chrono::milliseconds(connection_timeout_ms));
+        ++self->impl_->pending_io_;
         self->impl_->connect_timer_.async_wait([self, seq](const boost::system::error_code& timer_ec) {
+          IoCompletion completion{self->impl_.get()};
           if (timer_ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
             return;
           }
@@ -765,7 +1061,9 @@ void TcpClient::Impl::do_resolve_connect(std::shared_ptr<TcpClient> self, uint64
           }
         });
 
+        ++self->impl_->pending_io_;
         net::async_connect(self->impl_->socket_, results, [self, seq](auto ec2, const auto&) {
+          IoCompletion completion{self->impl_.get()};
           if (ec2 == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
             return;
           }
@@ -857,8 +1155,10 @@ void TcpClient::Impl::handshake_then(std::shared_ptr<TcpClient> self, uint64_t s
       return;
     }
 
+    ++pending_io_;
     tls_->async_handshake(ssl::stream_base::client,
                           net::bind_executor(strand_, [this, self, seq, next](const boost::system::error_code& ec) {
+                            IoCompletion completion{this};
                             if (seq != current_seq_.load() || stop_requested_.load() || stopping_.load()) return;
                             if (ec) {
                               WIRESTEAD_LOG_ERROR("tcp_client", "handshake", "TLS handshake failed: " + ec.message());
@@ -888,7 +1188,14 @@ void TcpClient::Impl::finish_connect(std::shared_ptr<TcpClient> self, uint64_t s
   // has not finished is not a usable connection, and connected() is what
   // callers poll before sending. Reporting true for a peer that failed
   // verification would be worse than useless.
-  connected_.store(true);
+  {
+    std::lock_guard<std::mutex> lock(submission_mtx_);
+    if (seq != current_seq_.load() || stop_requested_.load() || stopping_.load()) return;
+    write_wait_ = std::make_shared<detail::TcpWriteWait>(connection_seq_.load());
+    connected_.store(true);
+  }
+  rx_ = std::make_shared<std::vector<uint8_t>>(cfg_.read_buffer_size);
+  const auto connection = connection_seq_.load();
   transition_to(LinkState::Connected);
   boost::system::error_code ep_ec;
   auto rep = socket_.remote_endpoint(ep_ec);
@@ -898,14 +1205,14 @@ void TcpClient::Impl::finish_connect(std::shared_ptr<TcpClient> self, uint64_t s
   }
   start_read(self, seq);
   reset_idle_timer(self, seq);
-  net::post(strand_, [self, seq]() {
-    self->impl_->writing_ = false;
-    self->impl_->do_write(self, seq);
+  net::post(strand_, [self, seq, connection]() {
+    if (seq != self->impl_->current_seq_.load() || connection != self->impl_->connection_seq_.load()) return;
+    if (!self->impl_->writing_) self->impl_->do_write(self, seq);
   });
 }
 
 void TcpClient::Impl::schedule_retry(std::shared_ptr<TcpClient> self, uint64_t seq) {
-  connected_.store(false);
+  mark_disconnected();
   if (stop_requested_.load() || stopping_.load()) {
     return;
   }
@@ -965,7 +1272,9 @@ void TcpClient::Impl::schedule_retry(std::shared_ptr<TcpClient> self, uint64_t s
                      fmt::format("Scheduling retry in {:.3f}s", static_cast<double>(delay.count()) / 1000.0));
 
   retry_timer_.expires_after(delay);
+  ++pending_io_;
   retry_timer_.async_wait([self, seq](const boost::system::error_code& ec) {
+    IoCompletion completion{self->impl_.get()};
     // Clear pending flag regardless of result (fired or aborted)
     self->impl_->reconnect_pending_.store(false);
 
@@ -978,8 +1287,13 @@ void TcpClient::Impl::schedule_retry(std::shared_ptr<TcpClient> self, uint64_t s
 }
 
 void TcpClient::Impl::start_read(std::shared_ptr<TcpClient> self, uint64_t seq) {
-  auto on_read = [self, seq](auto ec, std::size_t n) {
-    if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
+  const auto connection = connection_seq_.load();
+  auto buffer = rx_;
+  ++pending_io_;
+  auto on_read = [self, seq, connection, buffer](auto ec, std::size_t n) {
+    IoCompletion completion{self->impl_.get()};
+    if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load() ||
+        connection != self->impl_->connection_seq_.load()) {
       return;
     }
     if (self->impl_->stop_requested_.load()) {
@@ -1000,31 +1314,16 @@ void TcpClient::Impl::start_read(std::shared_ptr<TcpClient> self, uint64_t seq) 
 
     self->impl_->stats_.record_received(n);
 
-    if (on_bytes) {
-      try {
-        (*on_bytes)(memory::ConstByteSpan(self->impl_->rx_.data(), n));
-      } catch (const std::exception& e) {
-        WIRESTEAD_LOG_ERROR("tcp_client", "on_bytes", fmt::format("Exception in on_bytes callback: {}", e.what()));
-        self->impl_->record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::COMMUNICATION, "on_bytes",
-                                  boost::asio::error::connection_aborted,
-                                  fmt::format("Exception in on_bytes: {}", e.what()), false, 0);
-        self->impl_->handle_close(self, seq, make_error_code(boost::asio::error::connection_aborted));
-        return;
-      } catch (...) {
-        WIRESTEAD_LOG_ERROR("tcp_client", "on_bytes", "Unknown exception in on_bytes callback");
-        self->impl_->handle_close(self, seq, make_error_code(boost::asio::error::connection_aborted));
-        return;
-      }
-    }
+    diagnostics::invoke_callback("tcp_client", "on_bytes", on_bytes, memory::ConstByteSpan(buffer->data(), n));
     self->impl_->start_read(self, seq);
   };
 #ifdef WIRESTEAD_TLS_ENABLED
   if (tls_active()) {
-    tls_->async_read_some(net::buffer(rx_.data(), rx_.size()), std::move(on_read));
+    tls_->async_read_some(net::buffer(buffer->data(), buffer->size()), std::move(on_read));
     return;
   }
 #endif
-  socket_.async_read_some(net::buffer(rx_.data(), rx_.size()), std::move(on_read));
+  socket_.async_read_some(net::buffer(buffer->data(), buffer->size()), std::move(on_read));
 }
 
 void TcpClient::Impl::do_write(std::shared_ptr<TcpClient> self, uint64_t seq) {
@@ -1049,20 +1348,57 @@ void TcpClient::Impl::do_write(std::shared_ptr<TcpClient> self, uint64_t seq) {
   }
   writing_ = true;
 
-  const auto queued_bytes = queue_util::take_gather_batch(tx_, current_write_batch_, current_write_views_);
+  // The ledger, not the admission mutex, fences this handoff against stop and
+  // loss: taking the admission mutex here per batch contends with every producer.
+  auto batch = std::make_shared<WriteBatch>();
+  const auto queued_bytes = queue_util::take_gather_batch(tx_, batch->buffers, batch->views, BufferProjection{});
+  batch->bytes = queued_bytes;
+  if (stop_requested_.load() ||
+      !send_accounting_.begin_batch(batch->buffers, [](const auto& item) { return item.request; })) {
+    // Stop/loss already terminated these; leave them to its queue cleanup.
+    queue_util::return_gather_batch(tx_, batch->buffers);
+    writing_ = false;
+    return;
+  }
+  active_write_ = batch;
+  const auto connection = connection_seq_.load();
 
-  auto on_write = [self, queued_bytes, seq](auto ec, std::size_t bytes_written) {
+  ++pending_io_;
+  auto on_write = [self, queued_bytes, seq, connection, batch](auto ec, std::size_t bytes_written) {
+    IoCompletion completion{self->impl_.get()};
+    bool current_connection;
+    {
+      // Only a failure must close admission; success needs just the ledger.
+      std::unique_lock<std::mutex> admission_lock(self->impl_->submission_mtx_, std::defer_lock);
+      if (ec) admission_lock.lock();
+      current_connection = connection == self->impl_->connection_seq_.load();
+      self->impl_->send_accounting_.complete_batch(
+          batch->buffers, bytes_written, [](const auto& item) { return item.request; },
+          [](const auto& item) {
+            return std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, item.buffer);
+          });
+      // Preserve the completed prefix and close admission before a competing
+      // stop can reclassify the rest of this connection as an explicit stop.
+      if (current_connection && ec && ec != net::error::operation_aborted && seq == self->impl_->current_seq_.load()) {
+        self->impl_->mark_disconnected_locked();
+      }
+    }
+    if (!current_connection) {
+      // Release pooled buffers while the captured client still owns its pool.
+      batch->buffers.clear();
+      return;
+    }
+    self->impl_->active_write_.reset();
     if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
-      self->impl_->current_write_batch_.clear();
-      self->impl_->queue_bytes_ =
-          (self->impl_->queue_bytes_ > queued_bytes) ? (self->impl_->queue_bytes_ - queued_bytes) : 0;
+      batch->buffers.clear();
+      queue_util::release_reserved_write_bytes(self->impl_->queue_bytes_, queued_bytes);
       self->impl_->report_backpressure(self, self->impl_->queue_bytes_);
       self->impl_->writing_ = false;
       return;
     }
 
     if (ec) {
-      queue_util::return_gather_batch(self->impl_->tx_, self->impl_->current_write_batch_);
+      queue_util::return_gather_batch(self->impl_->tx_, batch->buffers);
 
       WIRESTEAD_LOG_ERROR("tcp_client", "do_write", fmt::format("Write failed: {}", ec.message()));
       self->impl_->record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::COMMUNICATION, "write", ec,
@@ -1072,13 +1408,12 @@ void TcpClient::Impl::do_write(std::shared_ptr<TcpClient> self, uint64_t seq) {
       return;
     }
 
-    self->impl_->current_write_batch_.clear();
+    batch->buffers.clear();
     self->impl_->stats_.record_sent(bytes_written);
     if (bytes_written > 0) {
       self->impl_->reset_idle_timer(self, seq);
     }
-    self->impl_->queue_bytes_ =
-        (self->impl_->queue_bytes_ > queued_bytes) ? (self->impl_->queue_bytes_ - queued_bytes) : 0;
+    queue_util::release_reserved_write_bytes(self->impl_->queue_bytes_, queued_bytes);
     self->impl_->report_backpressure(self, self->impl_->queue_bytes_);
 
     if (self->impl_->stop_requested_.load() || self->impl_->state_.is_state(LinkState::Closed) ||
@@ -1090,19 +1425,34 @@ void TcpClient::Impl::do_write(std::shared_ptr<TcpClient> self, uint64_t seq) {
     self->impl_->do_write(self, seq);
   };
 
+  try {
+    if (auto hook = detail::g_tcp_write_initiation_hook.load()) hook();
 #ifdef WIRESTEAD_TLS_ENABLED
-  if (tls_active()) {
-    net::async_write(*tls_, current_write_views_, on_write);
+    if (tls_active()) {
+      net::async_write(*tls_, batch->views, on_write);
+    } else
+#endif
+    {
+      net::async_write(socket_, batch->views, on_write);
+    }
+  } catch (...) {
+    // No completion handler owns this pending-I/O slot after failed initiation.
+    // The accepted request crossed the local-write boundary; connection cleanup
+    // terminates it as an abort and discards requests still awaiting handoff.
+    --pending_io_;
+    mark_disconnected();
+    handle_close(self, seq, make_error_code(net::error::no_buffer_space));
     return;
   }
-#endif
-  net::async_write(socket_, current_write_views_, on_write);
+  if (auto hook = detail::g_tcp_write_started_hook.load()) hook();
 }
 
 void TcpClient::Impl::handle_close(std::shared_ptr<TcpClient> self, uint64_t seq, const boost::system::error_code& ec) {
   if (ec == net::error::operation_aborted || seq != current_seq_.load()) {
     return;
   }
+  mark_disconnected();
+  discard_connection_writes();
   WIRESTEAD_LOG_INFO("tcp_client", "handle_close", fmt::format("Closing connection. Error: {}", ec.message()));
   if (ec) {
     bool has_policy;
@@ -1116,7 +1466,6 @@ void TcpClient::Impl::handle_close(std::shared_ptr<TcpClient> self, uint64_t seq
     record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::CONNECTION, "handle_close", ec,
                  fmt::format("Connection closed with error: {}", ec.message()), retryable, current_attempts);
   }
-  connected_.store(false);
   writing_ = false;
   cancel_idle_timer();
   connect_timer_.cancel();
@@ -1134,6 +1483,8 @@ void TcpClient::Impl::handle_idle_timeout(std::shared_ptr<TcpClient> self, uint6
     return;
   }
 
+  mark_disconnected();
+  discard_connection_writes();
   IdleTimeoutAction idle_timeout_action;
   unsigned idle_timeout_ms;
   bool has_policy;
@@ -1154,7 +1505,6 @@ void TcpClient::Impl::handle_idle_timeout(std::shared_ptr<TcpClient> self, uint6
   record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::CONNECTION, "idle_timeout", ec,
                "Idle timeout expired", should_reconnect, current_attempts);
 
-  connected_.store(false);
   writing_ = false;
   cancel_idle_timer();
   connect_timer_.cancel();
@@ -1167,6 +1517,28 @@ void TcpClient::Impl::handle_idle_timeout(std::shared_ptr<TcpClient> self, uint6
 
   transition_to(LinkState::Connecting, ec);
   schedule_retry(self, seq);
+}
+
+void TcpClient::Impl::discard_connection_writes() {
+  size_t messages = tx_.size() + pending_.size();
+  size_t bytes = 0;
+  for (const auto& buffer : tx_)
+    bytes += std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, buffer.buffer);
+  for (const auto& buffer : pending_)
+    bytes += std::visit([](const auto& b) { return queue_util::variant_buffer_size(b); }, buffer.buffer);
+  if (active_write_) {
+    messages += active_write_->buffers.size();
+    bytes += active_write_->bytes;
+    // Its completion handler retains the buffers; it must not mutate new state.
+    active_write_.reset();
+  }
+  tx_.clear();
+  pending_.clear();
+  queue_bytes_ = 0;
+  pending_bytes_ = 0;
+  writing_ = false;
+  backpressure_active_ = false;
+  if (messages) stats_.record_dropped(messages, bytes);
 }
 
 void TcpClient::Impl::close_socket() {
@@ -1213,23 +1585,26 @@ queue_util::BackpressureFields TcpClient::Impl::bp_fields() {
                                         bp_high_,
                                         bp_low_,
                                         bp_limit_,
-                                        bp_strategy_.load(std::memory_order_relaxed)};
+                                        bp_strategy_.load(std::memory_order_relaxed),
+                                        &write_reserve_mtx_};
 }
 
-void TcpClient::Impl::route_enqueued_buffer(std::shared_ptr<TcpClient> self, BufferVariant&& buf, size_t added,
-                                            bool reserved) {
+void TcpClient::Impl::route_enqueued_buffer(std::shared_ptr<TcpClient> self, TrackedBuffer&& buf, size_t added) {
   if (stop_requested_.load() || state_.is_state(LinkState::Closed) || state_.is_state(LinkState::Error)) {
-    if (reserved) queue_util::release_reserved_limit_bytes(write_reserve_mtx_, inflight_bytes_, added);
+    queue_util::release_reserved_limit_bytes(write_reserve_mtx_, inflight_bytes_, added);
     stats_.record_failed_send();
     return;
   }
 
   auto f = bp_fields();
   queue_util::DropAccounting dropped;
-  auto decision = queue_util::decide_enqueue(f, added, tx_, dropped);
+  auto decision = queue_util::decide_enqueue(f, added, tx_, dropped, BufferProjection{}, [this](const auto& removed) {
+    send_accounting_.discard(removed.request, Ledger::Cause::QueuePressure);
+  });
   if (dropped.any()) stats_.record_dropped(dropped.messages, dropped.bytes);
 
   if (decision == queue_util::EnqueueDecision::Rejected) {
+    send_accounting_.discard(buf.request, Ledger::Cause::QueuePressure);
     WIRESTEAD_LOG_ERROR("tcp_client", "write", fmt::format("Queue limit exceeded ({} bytes)", queue_bytes_ + added));
     record_error(diagnostics::ErrorLevel::ERROR, diagnostics::ErrorCategory::COMMUNICATION, "write",
                  boost::asio::error::no_buffer_space, "Queue limit exceeded", false, 0);
@@ -1238,25 +1613,17 @@ void TcpClient::Impl::route_enqueued_buffer(std::shared_ptr<TcpClient> self, Buf
     // sent/dropped/queued accounting - record it as dropped so it's at
     // least observable.
     stats_.record_dropped(1, added);
-    if (reserved) queue_util::release_reserved_limit_bytes(write_reserve_mtx_, inflight_bytes_, added);
+    queue_util::release_reserved_limit_bytes(write_reserve_mtx_, inflight_bytes_, added);
     report_backpressure(self, queue_bytes_ + added);
     return;
   }
   if (decision == queue_util::EnqueueDecision::Pending) {
-    if (reserved) {
-      queue_util::commit_reserved_limit_bytes(write_reserve_mtx_, pending_bytes_, inflight_bytes_, added);
-    } else {
-      queue_util::commit_unreserved_limit_bytes(write_reserve_mtx_, pending_bytes_, added);
-    }
+    queue_util::commit_reserved_limit_bytes(write_reserve_mtx_, pending_bytes_, inflight_bytes_, added);
     pending_.emplace_back(std::move(buf));
     observe_queue();
     return;
   }
-  if (reserved) {
-    queue_util::commit_reserved_limit_bytes(write_reserve_mtx_, queue_bytes_, inflight_bytes_, added);
-  } else {
-    queue_util::commit_unreserved_limit_bytes(write_reserve_mtx_, queue_bytes_, added);
-  }
+  queue_util::commit_reserved_limit_bytes(write_reserve_mtx_, queue_bytes_, inflight_bytes_, added);
   tx_.emplace_back(std::move(buf));
   observe_queue();
   report_backpressure(self, queue_bytes_);
@@ -1320,6 +1687,15 @@ void TcpClient::Impl::transition_to(LinkState next, const boost::system::error_c
 }
 
 void TcpClient::Impl::perform_stop_cleanup() {
+  if (cleanup_started_.exchange(true)) return;
+  // Signals completion on every exit, including the error paths below.
+  struct CompletionSignal {
+    Impl* impl;
+    ~CompletionSignal() {
+      impl->cleanup_finished_ = true;
+      if (impl->pending_io_ == 0) impl->mark_cleanup_done();
+    }
+  } completion_signal{this};
   try {
     retry_timer_.cancel();
     connect_timer_.cancel();
@@ -1333,7 +1709,8 @@ void TcpClient::Impl::perform_stop_cleanup() {
     pending_.clear();
     pending_bytes_ = 0;
     writing_ = false;
-    connected_.store(false);
+    active_write_.reset();
+    mark_disconnected();
     // Deliberately does NOT fire on_bp_ here, unlike UDP/server sessions'
     // terminal drain (#434): this is an explicit, tested contract
     // (ContractComplianceTest.TcpClient_Backpressure_Contract) - a
@@ -1360,13 +1737,20 @@ void TcpClient::Impl::perform_stop_cleanup() {
 }
 
 void TcpClient::Impl::reset_start_state() {
+  cleanup_started_.store(false);
+  cleanup_finished_ = false;
+  inflight_bytes_.store(0);
+  {
+    std::lock_guard<std::mutex> lock(stop_mtx_);
+    cleanup_done_ = false;
+  }
   stop_requested_.store(false);
   stopping_.store(false);
   terminal_state_notified_.store(false);
   reconnect_pending_.store(false);
   retry_attempts_ = 0;
   reconnect_attempt_count_ = 0;
-  connected_.store(false);
+  mark_disconnected();
   writing_ = false;
   queue_bytes_ = 0;
   pending_.clear();
@@ -1463,8 +1847,12 @@ void TcpClient::Impl::reset_idle_timer(std::shared_ptr<TcpClient> self, uint64_t
 
   idle_timer_.cancel();
   idle_timer_.expires_after(std::chrono::milliseconds(idle_timeout_ms));
-  idle_timer_.async_wait([self, seq](const boost::system::error_code& ec) {
-    if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load()) {
+  const auto connection = connection_seq_.load();
+  ++pending_io_;
+  idle_timer_.async_wait([self, seq, connection](const boost::system::error_code& ec) {
+    IoCompletion completion{self->impl_.get()};
+    if (ec == net::error::operation_aborted || seq != self->impl_->current_seq_.load() ||
+        connection != self->impl_->connection_seq_.load()) {
       return;
     }
     if (!ec) {
