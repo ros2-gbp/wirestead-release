@@ -15,19 +15,22 @@
  */
 
 #pragma once
-
 #include <memory>
 #include <variant>
 
 #include "wirestead/base/error_codes.hpp"
 #include "wirestead/base/platform.hpp"
 #include "wirestead/base/visibility.hpp"
+#include "wirestead/interface/connection_channel.hpp"
+#include "wirestead/interface/result_channel.hpp"
 
 // Public API Context and Interface headers
 #include "wirestead/wrapper/context.hpp"
+#include "wirestead/wrapper/fanout_result.hpp"
 #include "wirestead/wrapper/ichannel.hpp"
 #include "wirestead/wrapper/iserver.hpp"
 #include "wirestead/wrapper/runtime_stats.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 // Wrapper implementations
 #include "wirestead/wrapper/serial/serial.hpp"
@@ -79,6 +82,9 @@ using MessageContext = wrapper::MessageContext;
 using ConnectionContext = wrapper::ConnectionContext;
 using ErrorContext = wrapper::ErrorContext;
 using RuntimeStats = wrapper::RuntimeStats;
+using SendResult = wrapper::SendResult;
+using FanoutResult = wrapper::FanoutResult;
+using SendRejection = wrapper::SendRejection;
 
 // === Public Builder API Convenience Functions ===
 

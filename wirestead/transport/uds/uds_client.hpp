@@ -27,10 +27,11 @@
 #include "wirestead/base/visibility.hpp"
 #include "wirestead/config/uds_config.hpp"
 #include "wirestead/diagnostics/error_types.hpp"
-#include "wirestead/interface/channel.hpp"
 #include "wirestead/interface/iuds_socket.hpp"
+#include "wirestead/interface/result_channel.hpp"
 #include "wirestead/memory/memory_pool.hpp"
 #include "wirestead/transport/base/reconnect_policy.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 // Forward declare boost components
 namespace boost {
@@ -40,7 +41,13 @@ class io_context;
 }  // namespace boost
 
 namespace wirestead {
+namespace wrapper {
+class UdsClient;
+}
 namespace transport {
+namespace detail {
+struct UdsWriteWait;
+}
 
 using base::LinkState;
 using config::UdsClientConfig;
@@ -49,7 +56,7 @@ using interface::Channel;
 /**
  * @brief Thread-safe UDS Client implementation
  */
-class WIRESTEAD_API UdsClient : public Channel, public std::enable_shared_from_this<UdsClient> {
+class WIRESTEAD_API UdsClient : public interface::ResultChannel, public std::enable_shared_from_this<UdsClient> {
  public:
   using BufferVariant =
       std::variant<memory::PooledBuffer, std::vector<uint8_t>, std::shared_ptr<const std::vector<uint8_t>>>;
@@ -73,16 +80,19 @@ class WIRESTEAD_API UdsClient : public Channel, public std::enable_shared_from_t
   void stop() override;
   bool is_connected() const override;
   bool is_backpressure_active() const override;
+  std::optional<size_t> write_queue_limit() const override;
   wrapper::RuntimeStats stats() const override;
   void reset_stats() override;
   boost::asio::any_io_executor get_executor() override;
 
-  bool async_write_copy(memory::ConstByteSpan data) override;
-  bool async_write_move(std::vector<uint8_t>&& data) override;
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
-  bool async_try_write_copy(memory::ConstByteSpan data) override;
-  bool async_try_write_move(std::vector<uint8_t>&& data) override;
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
 
   void on_bytes(OnBytes cb) override;
   void on_state(OnState cb) override;
@@ -95,6 +105,25 @@ class WIRESTEAD_API UdsClient : public Channel, public std::enable_shared_from_t
   void set_reconnect_policy(ReconnectPolicy policy);
 
  private:
+  // The built-in wrapper pins capacity waits without extending Channel's ABI.
+  friend class wrapper::UdsClient;
+  void fail_receive();
+  std::optional<uint64_t> write_connection() const;
+  std::shared_ptr<detail::UdsWriteWait> capture_write_wait() const;
+  std::optional<wrapper::SendResult> poll_write_wait(const std::shared_ptr<detail::UdsWriteWait>& wait) const;
+  void cancel_write_waits();
+  wrapper::SendResult write_state();
+  // Native admission only: wrapper lifecycle, validation precedence and
+  // strategy-level reason mapping remain the wrapper's responsibility.
+  wrapper::SendResult write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_connection);
+  wrapper::SendResult write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_connection);
+  wrapper::SendResult write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                   std::optional<uint64_t> expected_connection);
+
+  wrapper::SendResult try_write_copy(memory::ConstByteSpan data);
+  wrapper::SendResult try_write_move(std::vector<uint8_t>&& data);
+  wrapper::SendResult try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data);
+
   explicit UdsClient(const UdsClientConfig& cfg);
   explicit UdsClient(const UdsClientConfig& cfg, boost::asio::io_context& ioc);
   UdsClient(const UdsClientConfig& cfg, std::unique_ptr<interface::UdsSocketInterface> socket,

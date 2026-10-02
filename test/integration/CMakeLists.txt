@@ -98,21 +98,42 @@ foreach(
   test_file
   test_tcp_server_wrapper_lifecycle.cc
   test_tcp_client_wrapper_lifecycle.cc
+  test_tcp_client_stop_completion.cc
+  test_tcp_server_stop_completion.cc
+  test_tcp_stop_admission.cc
+  test_tcp_send_accounting.cc
+  test_udp_send_accounting.cc
+  test_server_send_accounting.cc
+  test_server_connect_order.cc
+  test_server_executor_policy.cc
+  test_receive_memory_servers.cc
+  test_receive_memory_clients.cc
+  test_lifecycle_events.cc
+  test_config_policy.cc
+  test_native_callback_policy.cc
+  test_udp_stop_admission.cc
+  test_udp_stop_completion.cc
   test_udp_stop_lifecycle.cc
   test_udp_options.cc
   test_udp_multicast.cc
   test_udp_failure.cc
   test_udp_state.cc
   test_udp_callback_race_stress.cc
+  test_udp_callback_serialization.cc
   test_tcp_client_error_mapping.cc
   test_udp_server_wrapper_transport.cc
   test_udp_server_wrapper_lifecycle.cc
   test_udp_client_wrapper_lifecycle.cc
   test_uds_wrapper_lifecycle.cc
+  test_uds_stop_admission.cc
+  test_uds_client_stop_completion.cc
+  test_uds_server_stop_completion.cc
   test_send_contract.cc
+  test_send_validation_before_wait.cc
   test_server_broadcast_contract.cc
   test_server_broadcast_slow_consumer_contract.cc
   test_server_batch_latency_flush.cc
+  test_server_callback_blocking_send.cc
   test_live_setter_forwarding.cc
 )
   get_filename_component(test_name ${test_file} NAME_WE)
@@ -214,8 +235,11 @@ wirestead_add_integration_gtest(
 
 # Serial integration tests NOTE: test_serial.cc temporarily disabled due to
 # complex variable naming issues
-foreach(test_file test_serial_builder_validation.cc test_serial_loopback.cc
-                  test_serial_timeout.cc
+foreach(
+  test_file
+  test_serial_builder_validation.cc test_serial_loopback.cc
+  test_serial_timeout.cc test_serial_stop_in_callback.cc
+  test_serial_stop_completion.cc test_serial_stop_admission.cc
 )
   get_filename_component(test_name ${test_file} NAME_WE)
   wirestead_add_integration_gtest(

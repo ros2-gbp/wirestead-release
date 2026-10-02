@@ -22,12 +22,19 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
+#include "server_reliable_result_test.hpp"
+#include "tcp_stop_with_context.hpp"
 #include "test_utils.hpp"
 #include "wirestead/framer/line_framer.hpp"
+#include "wirestead/transport/base/stop_test_hook.hpp"
+#include "wirestead/transport/tcp_server/boost_tcp_acceptor.hpp"
+#include "wirestead/transport/tcp_server/tcp_server.hpp"
 #include "wirestead/wirestead.hpp"
+#include "wirestead/wrapper/callback_guard.hpp"
 #include "wrapper_contract_test_utils.hpp"
 
 namespace {
@@ -334,7 +341,9 @@ TEST_F(TcpServerWrapperLifecycleTest, SendAndCountReflectLiveClientsAndReturnSta
   }
 
   // Send once first
-  if (target_id != 0) server_->send_to(target_id, "ping");
+  if (target_id != 0) {
+    EXPECT_TRUE(server_->send_to(target_id, "ping"));
+  }
   server_->broadcast("ping");
 
   // Final check
@@ -359,20 +368,17 @@ TEST_F(TcpServerWrapperLifecycleTest, PortRetryConfiguration) {
   EXPECT_TRUE(server_->listening());
 }
 
-TEST_F(TcpServerWrapperLifecycleTest, ConcurrentStartStop) {
+// D-1 permits concurrent stops. Restart waits until ALL those calls have
+// returned; overlapping start/stop is explicitly a caller precondition.
+TEST_F(TcpServerWrapperLifecycleTest, RestartAfterConcurrentStops) {
   server_ = wirestead::tcp_server(test_port_).on_data([](auto&&) {}).on_error([](auto&&) {}).build();
-  std::vector<std::thread> threads;
-  for (int i = 0; i < 2; ++i) {  // Reduced count for stability
-    threads.emplace_back([this]() {
-      for (int j = 0; j < 5; ++j) {
-        auto f = server_->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        server_->stop();
-      }
-    });
+  for (int cycle = 0; cycle < 5; ++cycle) {
+    ASSERT_TRUE(server_->start_sync());
+    std::vector<std::jthread> stoppers;
+    for (int caller = 0; caller < 2; ++caller) stoppers.emplace_back([this] { server_->stop(); });
+    for (auto& stopper : stoppers) stopper.join();
+    EXPECT_FALSE(server_->listening());
   }
-  for (auto& t : threads) t.join();
-  SUCCEED();
 }
 
 TEST_F(TcpServerWrapperLifecycleTest, HandlerReplacement) {
@@ -662,4 +668,194 @@ TEST_F(TcpServerWrapperLifecycleTest, ClientStatsAreReportedPerSession) {
   EXPECT_GE(server_->stats().bytes_received, large.size());
 }
 
+}  // namespace
+
+namespace {
+thread_local std::optional<wirestead::wrapper::SendResult> target_result;
+thread_local int target_observations = 0;
+void observe_target_result(const wirestead::wrapper::SendResult& result) {
+  target_result = result;
+  ++target_observations;
+}
+class TcpServerTargetResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(TcpServerTargetResultTest, CombinesValidationLifecycleAndSessionAdmission) {
+  using namespace wirestead;
+  using Rejection = wrapper::SendRejection;
+  boost::asio::io_context io;
+  config::TcpServerConfig cfg;
+  cfg.port = test::TestUtils::getAvailableTestPort();
+  cfg.backpressure_threshold = 1024;
+  cfg.backpressure_strategy = (GetParam() >= 2 && GetParam() < 11) || GetParam() == 14
+                                  ? base::constants::BackpressureStrategy::BestEffort
+                                  : base::constants::BackpressureStrategy::Reliable;
+  auto native = transport::TcpServer::create(cfg, std::make_unique<transport::BoostTcpAcceptor>(io), io);
+  wrapper::TcpServer server(native);
+  server.backpressure_strategy(GetParam() >= 11 && GetParam() < 14 ? base::constants::BackpressureStrategy::Reliable
+                                                                   : cfg.backpressure_strategy);
+  wrapper::detail::g_tcp_server_send_result_hook.store(observe_target_result);
+  transport::detail::g_tcp_server_write_result_hook.store(observe_target_result);
+  struct Cleanup {
+    std::function<void()> action;
+    ~Cleanup() { action(); }
+  } cleanup{[&] {
+    wrapper::detail::g_tcp_server_send_result_hook.store(nullptr);
+    transport::detail::g_tcp_server_write_result_hook.store(nullptr);
+    test::stop_wrapper_with_context(server, io);
+  }};
+  auto until = [&](auto predicate) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!predicate()) {
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (io.stopped()) io.restart();
+      io.run_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  };
+  ClientId id = 999;
+  const bool native_form = GetParam() >= 6 && GetParam() < 10;
+  const bool reliable_form = GetParam() >= 11;
+  const bool line_form = (!native_form && GetParam() < 11 && GetParam() % 2) || GetParam() == 12;
+  auto write = [&](std::string_view data) {
+    target_result.reset();
+    target_observations = 0;
+    bool accepted;
+    auto public_acceptance = [&](wrapper::SendResult result) {
+      EXPECT_TRUE(target_result.has_value());
+      if (target_result) {
+        EXPECT_EQ(target_result->accepted(), result.accepted());
+        if (!result.accepted() && !target_result->accepted()) {
+          EXPECT_EQ(target_result->reason(), result.reason());
+        }
+      }
+      target_result = result;
+      return result.accepted();
+    };
+    if (reliable_form) {
+      if (GetParam() == 11)
+        accepted = public_acceptance(server.send_to(id, data));
+      else if (GetParam() == 12)
+        accepted = public_acceptance(server.send_to_line(id, data));
+      else
+        accepted = public_acceptance(server.send_to_blocking(id, data));
+    } else if (native_form) {
+      if (GetParam() == 6)
+        accepted = native->send_to_client(id, data);
+      else if (GetParam() == 7)
+        accepted = native->try_send_to_client(id, data);
+      else if (GetParam() == 8)
+        accepted = native->send_to_client(
+            id, memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+      else
+        accepted = native->try_send_to_client(
+            id, memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    } else if (GetParam() >= 2 && GetParam() < 4) {
+      accepted = public_acceptance(GetParam() % 2 ? server.send_to_line(id, data) : server.send_to(id, data));
+    } else {
+      accepted = public_acceptance(GetParam() % 2 ? server.try_send_to_line(id, data) : server.try_send_to(id, data));
+    }
+    EXPECT_EQ(target_observations, 1);
+    EXPECT_TRUE(target_result.has_value());
+    if (target_result) {
+      EXPECT_EQ(target_result->accepted(), accepted);
+    }
+    return accepted;
+  };
+  auto reason = [&](Rejection expected) {
+    ASSERT_TRUE(target_result.has_value());
+    ASSERT_FALSE(target_result->accepted());
+    EXPECT_EQ(target_result->reason(), expected);
+  };
+  EXPECT_FALSE(write("valid"));
+  reason(Rejection::NotStarted);
+  if (!native_form && !line_form) {
+    EXPECT_FALSE(write(""));
+    reason(Rejection::InvalidArgument);
+  }
+  if (GetParam() == 10) {
+    native->start();
+    ASSERT_TRUE(until([&] { return server.listening(); }));
+    EXPECT_FALSE(write("native running before wrapper start"));
+    reason(Rejection::NotStarted);
+  }
+  auto ready = server.start();
+  ASSERT_TRUE(until([&] { return ready.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }));
+  ASSERT_TRUE(ready.get());
+  EXPECT_FALSE(write("missing"));
+  reason(Rejection::NotReady);
+  boost::asio::ip::tcp::socket peer(io);
+  peer.connect({boost::asio::ip::make_address("127.0.0.1"), cfg.port});
+  ASSERT_TRUE(until([&] { return native->client_count() == 1; }));
+  id = native->connected_clients().front();
+  if (!native_form) {
+    const auto failures = native->stats().failed_sends;
+    EXPECT_FALSE(write(std::string(*native->write_queue_limit(id) + 1, 'x')));
+    reason(Rejection::TooLarge);
+    EXPECT_EQ(native->stats().failed_sends, failures);
+  }
+  EXPECT_TRUE(write("ok"));
+  const bool ordinary = reliable_form || (native_form && GetParam() % 2 == 0);
+  const size_t used = line_form ? 3 : 2;
+  const auto fill = ordinary ? *native->write_queue_limit(id) - used : 1024 - used;
+  if (ordinary)
+    ASSERT_TRUE(native->send_to_client(id, std::string(fill, 'f')));
+  else
+    ASSERT_TRUE(native->try_send_to_client(id, std::string(fill, 'f')));
+  const auto failures_before = native->stats().failed_sends;
+  {
+    // A paused executor cannot free this reservation. Callback callers must
+    // refuse immediately; independent tests cover unbounded retries and stop.
+    wrapper::detail::CallbackGuard callback;
+    EXPECT_FALSE(write("full"));
+    reason(GetParam() >= 2 && GetParam() < 4 ? Rejection::QueueFull : Rejection::WouldBlock);
+  }
+  if (reliable_form) {
+    EXPECT_EQ(native->stats().failed_sends, failures_before + 1);
+    {
+      wrapper::detail::CallbackGuard callback;
+      EXPECT_FALSE(write("callback"));
+      reason(Rejection::WouldBlock);
+    }
+    EXPECT_EQ(native->stats().failed_sends, failures_before + 2);
+    const auto failures = native->stats().failed_sends;
+    EXPECT_FALSE(write(std::string(*native->write_queue_limit(id) + 1, 'x')));
+    reason(Rejection::TooLarge);
+    EXPECT_EQ(native->stats().failed_sends, failures);
+  }
+  peer.close();
+  ASSERT_TRUE(until([&] { return native->client_count() == 0; }));
+  EXPECT_FALSE(write("disconnected"));
+  reason(Rejection::NotReady);
+  bool stopped = false;
+  boost::asio::post(io, [&] {
+    server.stop();
+    EXPECT_FALSE(write("stopping"));
+    reason(Rejection::Stopping);
+    stopped = true;
+  });
+  ASSERT_TRUE(until([&] { return stopped; }));
+  test::stop_wrapper_with_context(server, io);
+  EXPECT_FALSE(write("stopped"));
+  reason(Rejection::NotStarted);
+}
+INSTANTIATE_TEST_SUITE_P(WrapperAndNativeForms, TcpServerTargetResultTest, ::testing::Range(0, 15));
+}  // namespace
+
+namespace {
+class TcpServerReliableWaitResultTest : public ::testing::TestWithParam<int> {};
+TEST_P(TcpServerReliableWaitResultTest, PreservesFirstCauseAndPinsAdmission) {
+  using namespace wirestead;
+  boost::asio::io_context io;
+  config::TcpServerConfig cfg;
+  cfg.port = test::TestUtils::getAvailableTestPort();
+  cfg.backpressure_threshold = 1024;
+
+  auto native = transport::TcpServer::create(cfg, std::make_unique<transport::BoostTcpAcceptor>(io), io);
+  boost::asio::ip::tcp::socket peer(io);
+  test::server_wait::run_case<wrapper::TcpServer>(
+      GetParam() / 4, GetParam() % 4, io, native, peer,
+      [&](auto& socket) { socket.connect({boost::asio::ip::make_address("127.0.0.1"), cfg.port}); },
+      {wrapper::detail::g_tcp_server_send_result_hook, wrapper::detail::g_tcp_server_capacity_wait_hook,
+       wrapper::detail::g_tcp_server_capacity_wait_result_hook, transport::detail::g_tcp_server_pinned_write_hook});
+}
+INSTANTIATE_TEST_SUITE_P(FormsAndTerminalEvents, TcpServerReliableWaitResultTest, ::testing::Range(0, 44));
 }  // namespace

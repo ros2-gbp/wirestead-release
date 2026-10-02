@@ -165,6 +165,8 @@ target_compile_features(wirestead_consumer_smoke PRIVATE cxx_std_20)
 EOF
 
 cat > "$CONSUMER_DIR/main.cpp" <<'EOF'
+#include <type_traits>
+#include <wirestead/interface/connection_channel.hpp>
 #include <atomic>
 #include <cstdint>
 #include <chrono>
@@ -182,6 +184,7 @@ cat > "$CONSUMER_DIR/main.cpp" <<'EOF'
 #endif
 
 #include <wirestead/wirestead.hpp>
+#include <wirestead/transport/tcp_client/tcp_client.hpp>
 
 // Public API reachable only through the umbrella header. set_io_thread_init was
 // documented in docs/tuning.md while wirestead.hpp did not include its header,
@@ -232,8 +235,41 @@ bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout) {
     return false;
 }
 
+static_assert(std::is_base_of_v<wirestead::interface::ResultChannel,
+                                wirestead::interface::ConnectionChannel>);
+static_assert(std::has_virtual_destructor_v<wirestead::interface::WriteConnection>);
+
 int main() {
     umbrella_reaches_public_api();
+    boost::asio::io_context admission_io;
+    std::shared_ptr<wirestead::interface::Channel> legacy_channel =
+        wirestead::transport::TcpClient::create(wirestead::config::TcpClientConfig{}, admission_io);
+    auto result_channel = std::dynamic_pointer_cast<wirestead::interface::ResultChannel>(legacy_channel);
+    if (!result_channel) return 11;
+    const uint8_t probe = 1;
+    const auto admission = result_channel->async_try_write_copy_result({&probe, 1});
+    if (admission.accepted() || admission.reason() != wirestead::SendRejection::NotStarted) return 12;
+    if (legacy_channel->async_try_write_copy({&probe, 1})) return 13;
+
+    wirestead::wrapper::TcpClient stopped_client("127.0.0.1", 12345);
+    wirestead::wrapper::ChannelInterface& client_api = stopped_client;
+    const wirestead::wrapper::SendResult client_stopped = client_api.try_send("probe");
+    if (client_stopped.accepted() || client_stopped.reason() != wirestead::SendRejection::NotStarted) return 14;
+    const auto invalid_client = client_api.send_shared(nullptr);
+    if (invalid_client.accepted() || invalid_client.reason() != wirestead::SendRejection::InvalidArgument) return 15;
+
+    wirestead::wrapper::TcpServer stopped_server(0);
+    wirestead::wrapper::ServerInterface& server_api = stopped_server;
+    const wirestead::FanoutResult empty_fanout = server_api.broadcast("probe");
+    if (!empty_fanout.empty() || empty_fanout.target_count() != 0) {
+        std::cerr << "unstarted server selected fanout targets\n";
+        return 1;
+    }
+    const wirestead::wrapper::SendResult stopped = server_api.send_to(1, "probe");
+    if (stopped.accepted() || stopped.reason() != wirestead::wrapper::SendRejection::NotStarted) {
+        std::cerr << "installed server result contract mismatch\n";
+        return 10;
+    }
     const auto port = reserve_tcp_port();
     if (port == 0) {
         std::cerr << "failed to reserve a TCP loopback port\n";
@@ -248,7 +284,9 @@ int main() {
         .auto_start(false)
         .on_data([&](const wirestead::MessageContext& ctx) {
             server_received.fetch_add(1);
-            if (tcp_server) tcp_server->send_to(ctx.client_id(), "pong");
+            if (tcp_server && !tcp_server->send_to(ctx.client_id(), "pong")) {
+                std::cerr << "installed server rejected reply\n";
+            }
         })
         .on_error([](const wirestead::ErrorContext&) {})
         .build();
@@ -291,7 +329,9 @@ int main() {
         return 7;
     }
 
-    if (!tcp_server->broadcast("broadcast")) {
+    const wirestead::FanoutResult fanout = tcp_server->broadcast("broadcast");
+    if (fanout.target_count() != 1 || fanout.accepted_count() != 1 ||
+        fanout.rejected_count() != 0 || fanout.empty()) {
         std::cerr << "installed TCP broadcast failed\n";
         tcp_client->stop();
         tcp_server->stop();
@@ -371,60 +411,3 @@ fi
 
 echo
 echo "Installed consumer smoke passed for library mode: $LIBRARY_MODE"
-
-legacy_consumer_dir="${CONSUMER_DIR}-legacy-unilink"
-rm -rf "$legacy_consumer_dir"
-mkdir -p "$legacy_consumer_dir"
-
-log_step "Generating find_package(unilink) legacy consumer project"
-cat > "$legacy_consumer_dir/CMakeLists.txt" <<'EOF'
-cmake_minimum_required(VERSION 3.12)
-project(unilink_consumer_smoke LANGUAGES CXX)
-
-find_package(unilink CONFIG REQUIRED)
-
-add_executable(unilink_consumer_smoke main.cpp)
-target_link_libraries(unilink_consumer_smoke PRIVATE unilink::unilink)
-target_compile_features(unilink_consumer_smoke PRIVATE cxx_std_20)
-EOF
-
-cat > "$legacy_consumer_dir/main.cpp" <<'EOF'
-#include <unilink/unilink.hpp>
-
-int main() {
-    // Port is never bound (auto_start(false), never start_sync()'d) - any
-    // valid port number satisfies this build()-only smoke check.
-    auto tcp_server = unilink::tcp_server(45678).auto_start(false).build();
-    return tcp_server ? 0 : 1;
-}
-EOF
-
-legacy_consumer_build_dir="$legacy_consumer_dir/build"
-
-legacy_consumer_args=(
-  -S "$legacy_consumer_dir"
-  -B "$legacy_consumer_build_dir"
-  -G "$CMAKE_GENERATOR"
-  -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
-  -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX"
-)
-
-if [[ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]]; then
-  legacy_consumer_args+=("-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
-fi
-
-if [[ -n "${VCPKG_TARGET_TRIPLET:-}" ]]; then
-  legacy_consumer_args+=("-DVCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}")
-fi
-
-log_step "Configuring find_package(unilink) legacy consumer"
-cmake "${legacy_consumer_args[@]}"
-
-log_step "Building find_package(unilink) legacy consumer"
-cmake --build "$legacy_consumer_build_dir" --parallel
-
-log_step "Running find_package(unilink) legacy consumer runtime smoke"
-"$legacy_consumer_build_dir/unilink_consumer_smoke"
-
-echo
-echo "Installed find_package(unilink) legacy consumer smoke passed for library mode: $LIBRARY_MODE"

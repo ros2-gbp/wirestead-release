@@ -1,0 +1,523 @@
+/*
+ * Copyright 2025 Jinwoo Sung
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <gtest/gtest.h>
+
+#include <deque>
+#include <thread>
+#include <vector>
+
+#include "wirestead/diagnostics/runtime_stats_counter.hpp"
+#include "wirestead/diagnostics/send_accounting.hpp"
+
+namespace {
+using Ledger = wirestead::diagnostics::SendAccountingLedger;
+using Cause = Ledger::Cause;
+
+void expect_conservation(const wirestead::wrapper::SendAccounting& s) {
+  EXPECT_EQ(s.accepted.requests,
+            s.written.requests + s.outstanding.requests + s.explicit_stop.discarded_before_write.requests +
+                s.explicit_stop.aborted_during_write.requests + s.connection_loss.discarded_before_write.requests +
+                s.connection_loss.aborted_during_write.requests + s.queue_pressure.discarded_before_write.requests +
+                s.queue_pressure.aborted_during_write.requests + s.session_expiry.discarded_before_write.requests +
+                s.session_expiry.aborted_during_write.requests);
+  EXPECT_EQ(s.accepted.bytes,
+            s.written.bytes + s.outstanding.bytes + s.explicit_stop.discarded_before_write.bytes +
+                s.explicit_stop.aborted_during_write.bytes + s.connection_loss.discarded_before_write.bytes +
+                s.connection_loss.aborted_during_write.bytes + s.queue_pressure.discarded_before_write.bytes +
+                s.queue_pressure.aborted_during_write.bytes + s.session_expiry.discarded_before_write.bytes +
+                s.session_expiry.aborted_during_write.bytes);
+}
+
+TEST(SendAccountingTest, FailedSubmissionRollsBackBeforeReturningAcceptance) {
+  Ledger ledger;
+  {
+    Ledger::Admission pending(ledger, 11);
+    EXPECT_EQ(ledger.snapshot().outstanding.requests, 1u);
+  }
+  EXPECT_EQ(ledger.snapshot().accepted.requests, 0u);
+  EXPECT_EQ(ledger.snapshot().outstanding.requests, 0u);
+  {
+    Ledger::Admission submitted(ledger, 13);
+    submitted.commit();
+  }
+  ledger.end(Cause::ExplicitStop);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.accepted.requests, 1u);
+  EXPECT_EQ(s.explicit_stop.discarded_before_write.bytes, 13u);
+  expect_conservation(s);
+}
+
+TEST(SendAccountingTest, UnsupportedStatsAreNotReportedAsZeroLoss) {
+  wirestead::diagnostics::RuntimeStatsCounters legacy;
+  EXPECT_FALSE(legacy.snapshot(0, 0, false).send_accounting.has_value());
+}
+TEST(SendAccountingTest, QueuedAndActiveLossRemainDistinctAndFirstCauseWins) {
+  Ledger ledger;
+  const auto queued = ledger.admit(11), active = ledger.admit(23);
+  ASSERT_TRUE(ledger.begin(active));
+  ledger.end(Cause::ConnectionLoss);
+  ledger.end(Cause::ExplicitStop);
+  ledger.complete(active, 23);
+  ledger.discard(queued, Cause::QueuePressure);
+  EXPECT_FALSE(ledger.begin(queued));
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.connection_loss.discarded_before_write.requests, 1u);
+  EXPECT_EQ(s.connection_loss.discarded_before_write.bytes, 11u);
+  EXPECT_EQ(s.connection_loss.aborted_during_write.requests, 1u);
+  EXPECT_EQ(s.connection_loss.aborted_during_write.bytes, 23u);
+  EXPECT_EQ(s.explicit_stop.aborted_during_write.requests, 0u);
+  EXPECT_EQ(s.confirmed_written_bytes, 0u);
+  expect_conservation(s);
+}
+TEST(SendAccountingTest, PartialGatherPrefixCountsLogicalRequestsAndConfirmedBytes) {
+  Ledger ledger;
+  const auto a = ledger.admit(4), b = ledger.admit(7), c = ledger.admit(9);
+  ledger.begin(a);
+  ledger.begin(b);
+  ledger.begin(c);
+  ledger.complete(a, 4);
+  ledger.complete(b, 2);
+  ledger.complete(c, 0);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.requests, 1u);
+  EXPECT_EQ(s.written.bytes, 4u);
+  EXPECT_EQ(s.connection_loss.aborted_during_write.requests, 2u);
+  EXPECT_EQ(s.connection_loss.aborted_during_write.bytes, 16u);
+  EXPECT_EQ(s.confirmed_written_bytes, 6u);
+  expect_conservation(s);
+}
+TEST(SendAccountingTest, ResetExcludesOldRequestsWithoutReusingIds) {
+  Ledger ledger;
+  const auto active = ledger.admit(10), pending = ledger.admit(20);
+  ledger.begin(active);
+  ledger.reset();
+  const auto fresh = ledger.admit(30);
+  EXPECT_NE(active, fresh);
+  EXPECT_NE(pending, fresh);
+  ledger.complete(active, 10);
+  ledger.begin(pending);
+  ledger.complete(pending, 20);
+  ledger.begin(fresh);
+  ledger.complete(fresh, 30);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.accepted.requests, 1u);
+  EXPECT_EQ(s.written.bytes, 30u);
+  EXPECT_EQ(s.confirmed_written_bytes, 30u);
+  expect_conservation(s);
+}
+TEST(SendAccountingTest, OldCompletionCannotTerminateReplacementConnectionRequest) {
+  Ledger ledger;
+  const auto old = ledger.admit(5);
+  ledger.begin(old);
+  ledger.end(Cause::ConnectionLoss);
+  const auto fresh = ledger.admit(7);
+  ledger.begin(fresh);
+  ledger.complete(old, 5);
+  EXPECT_EQ(ledger.snapshot().outstanding.requests, 1u);
+  ledger.complete(fresh, 7);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.connection_loss.aborted_during_write.bytes, 5u);
+  EXPECT_EQ(s.written.bytes, 7u);
+  expect_conservation(s);
+}
+
+TEST(SendAccountingTest, PressureRemovesOnlyTheSelectedRequest) {
+  Ledger ledger;
+  const auto a = ledger.admit(7), b = ledger.admit(7);
+  ledger.discard(a, Cause::QueuePressure);
+  ledger.begin(b);
+  ledger.complete(b, 7);
+  ledger.discard(a, Cause::ExplicitStop);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.queue_pressure.discarded_before_write.requests, 1u);
+  EXPECT_EQ(s.written.requests, 1u);
+  expect_conservation(s);
+}
+TEST(SendAccountingTest, StopCompletionRaceTerminatesEachRequestExactlyOnce) {
+  for (int round = 0; round < 100; ++round) {
+    Ledger ledger;
+    const auto request = ledger.admit(19);
+    ledger.begin(request);
+    std::thread complete([&] { ledger.complete(request, 19); });
+    std::thread stop([&] { ledger.end(Cause::ExplicitStop); });
+    complete.join();
+    stop.join();
+    const auto s = ledger.snapshot();
+    EXPECT_EQ(s.written.requests + s.explicit_stop.aborted_during_write.requests, 1u);
+    EXPECT_EQ(s.outstanding.requests, 0u);
+    expect_conservation(s);
+  }
+}
+
+TEST(SendAccountingTest, GroupsSeparatePeersAndUnattributedRequests) {
+  Ledger ledger;
+  auto first = std::make_shared<Ledger::Group>();
+  auto second = std::make_shared<Ledger::Group>();
+  const auto a = ledger.admit(11, first), b = ledger.admit(17, second), raw = ledger.admit(23);
+  ledger.begin(a);
+  ledger.complete(a, 11);
+  ledger.discard(b, Cause::QueuePressure);
+  ledger.begin(raw);
+  ledger.complete(raw, 23);
+  EXPECT_EQ(ledger.snapshot(first).written.bytes, 11u);
+  EXPECT_EQ(ledger.snapshot(second).queue_pressure.discarded_before_write.bytes, 17u);
+  EXPECT_EQ(ledger.snapshot().accepted.bytes, 51u);
+  EXPECT_EQ(ledger.snapshot().written.bytes, 34u);
+  expect_conservation(ledger.snapshot(first));
+  expect_conservation(ledger.snapshot(second));
+  expect_conservation(ledger.snapshot());
+}
+
+TEST(SendAccountingTest, GroupResetExcludesCompletedAndOutstandingOldEpoch) {
+  Ledger ledger;
+  auto group = std::make_shared<Ledger::Group>();
+  const auto completed = ledger.admit(5, group), active = ledger.admit(7, group);
+  ledger.begin(completed);
+  ledger.complete(completed, 5);
+  ledger.begin(active);
+  ledger.reset();
+  EXPECT_EQ(ledger.snapshot(group).accepted.requests, 0u);
+  const auto fresh = ledger.admit(11, group);
+  ledger.complete(active, 7);
+  ledger.begin(fresh);
+  ledger.complete(fresh, 11);
+  EXPECT_EQ(ledger.snapshot(group).accepted.requests, 1u);
+  EXPECT_EQ(ledger.snapshot(group).confirmed_written_bytes, 11u);
+  expect_conservation(ledger.snapshot(group));
+  expect_conservation(ledger.snapshot());
+}
+
+TEST(SendAccountingTest, RetiredGroupCompletionDoesNotUpdateReplacement) {
+  Ledger ledger;
+  auto retired = std::make_shared<Ledger::Group>();
+  const auto old = ledger.admit(7, retired);
+  ledger.begin(old);
+  std::weak_ptr<Ledger::Group> lifetime = retired;
+  retired.reset();
+  EXPECT_FALSE(lifetime.expired());
+  auto replacement = std::make_shared<Ledger::Group>();
+  const auto fresh = ledger.admit(11, replacement);
+  ledger.complete(old, 7);
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_EQ(ledger.snapshot(replacement).written.requests, 0u);
+  ledger.discard(fresh, Cause::ExplicitStop);
+  EXPECT_EQ(ledger.snapshot().written.bytes, 7u);
+  EXPECT_EQ(ledger.snapshot(replacement).explicit_stop.discarded_before_write.bytes, 11u);
+  expect_conservation(ledger.snapshot(replacement));
+  expect_conservation(ledger.snapshot());
+}
+
+TEST(SendAccountingTest, GroupRollbackAndTerminalRaceMatchAggregate) {
+  Ledger ledger;
+  auto group = std::make_shared<Ledger::Group>();
+  { Ledger::Admission failed(ledger, 13, group); }
+  EXPECT_EQ(ledger.snapshot(group).accepted.requests, 0u);
+  const auto request = ledger.admit(19, group);
+  ledger.begin(request);
+  std::thread complete([&] { ledger.complete(request, 19); });
+  std::thread stop([&] { ledger.end(Cause::ExplicitStop); });
+  complete.join();
+  stop.join();
+  const auto total = ledger.snapshot(), peer = ledger.snapshot(group);
+  EXPECT_EQ(peer.written.requests, total.written.requests);
+  EXPECT_EQ(peer.explicit_stop.aborted_during_write.requests, total.explicit_stop.aborted_during_write.requests);
+  EXPECT_EQ(peer.written.requests + peer.explicit_stop.aborted_during_write.requests, 1u);
+  expect_conservation(peer);
+  expect_conservation(total);
+}
+
+TEST(SendAccountingTest, ExpiryDiscardsOnlyWaitingRequestsOfSelectedGroup) {
+  Ledger ledger;
+  auto a = std::make_shared<Ledger::Group>(), b = std::make_shared<Ledger::Group>();
+  const auto active = ledger.admit(7, a), queued = ledger.admit(11, a), other = ledger.admit(13, b);
+  ledger.begin(active);
+  ledger.discard_waiting(a, Cause::SessionExpiry);
+  EXPECT_FALSE(ledger.contains(queued));
+  EXPECT_TRUE(ledger.contains(active));
+  EXPECT_TRUE(ledger.contains(other));
+  ledger.complete(active, 7);
+  ledger.begin(other);
+  ledger.complete(other, 13);
+  ledger.end(Cause::ExplicitStop);
+  EXPECT_EQ(ledger.snapshot(a).session_expiry.discarded_before_write.bytes, 11u);
+  EXPECT_EQ(ledger.snapshot(a).written.bytes, 7u);
+  EXPECT_EQ(ledger.snapshot(b).written.bytes, 13u);
+  expect_conservation(ledger.snapshot(a));
+  expect_conservation(ledger.snapshot(b));
+  expect_conservation(ledger.snapshot());
+}
+TEST(SendAccountingTest, ExpiredActiveWriteRetainsFailureOrStopOutcome) {
+  for (bool stop : {false, true}) {
+    Ledger ledger;
+    auto group = std::make_shared<Ledger::Group>();
+    const auto active = ledger.admit(7, group);
+    ledger.begin(active);
+    ledger.discard_waiting(group, Cause::SessionExpiry);
+    if (stop)
+      ledger.end(Cause::ExplicitStop);
+    else
+      ledger.complete(active, 3);
+    auto s = ledger.snapshot(group);
+    EXPECT_EQ(s.session_expiry.aborted_during_write.requests, 0u);
+    EXPECT_EQ(s.explicit_stop.aborted_during_write.requests, stop ? 1u : 0u);
+    EXPECT_EQ(s.connection_loss.aborted_during_write.requests, stop ? 0u : 1u);
+    expect_conservation(s);
+  }
+}
+TEST(SendAccountingTest, ExpiryAfterResetRemovesOldWaitingWorkWithoutCountingIt) {
+  Ledger ledger;
+  auto group = std::make_shared<Ledger::Group>();
+  const auto old = ledger.admit(7, group);
+  ledger.reset();
+  ledger.admit(11, group);
+  ledger.discard_waiting(group, Cause::SessionExpiry);
+  EXPECT_FALSE(ledger.contains(old));
+  EXPECT_EQ(ledger.snapshot(group).session_expiry.discarded_before_write.bytes, 11u);
+  expect_conservation(ledger.snapshot(group));
+  expect_conservation(ledger.snapshot());
+}
+
+struct BatchRequest {
+  Ledger::Request request;
+  size_t bytes;
+};
+constexpr auto request_of = [](const BatchRequest& item) { return item.request; };
+constexpr auto size_of = [](const BatchRequest& item) { return item.bytes; };
+
+TEST(SendAccountingTest, BatchCompletionPreservesEveryPartialPrefix) {
+  for (size_t prefix = 0; prefix <= 21; ++prefix) {
+    Ledger ledger;
+    const std::vector<BatchRequest> batch{{ledger.admit(4), 4}, {ledger.admit(7), 7}, {ledger.admit(9), 9}};
+    ledger.begin_batch(batch, request_of);
+    ledger.complete_batch(batch, prefix, request_of, size_of);
+    const auto s = ledger.snapshot();
+    const size_t full = (prefix >= 4 ? 1u : 0u) + (prefix >= 11 ? 1u : 0u) + (prefix >= 20 ? 1u : 0u);
+    EXPECT_EQ(s.written.requests, full);
+    EXPECT_EQ(s.connection_loss.aborted_during_write.requests, 3u - full);
+    EXPECT_EQ(s.confirmed_written_bytes, std::min(prefix, size_t{20}));
+    EXPECT_EQ(s.outstanding.requests, 0u);
+    ledger.complete_batch(batch, 20, request_of, size_of);
+    EXPECT_EQ(ledger.snapshot().confirmed_written_bytes, s.confirmed_written_bytes);
+    expect_conservation(ledger.snapshot());
+  }
+}
+
+TEST(SendAccountingTest, BatchPrefixConsumesRetiredAndOldEpochEntries) {
+  Ledger ledger;
+  auto group = std::make_shared<Ledger::Group>();
+  const auto retired = ledger.admit(4, group);
+  ledger.discard(retired, Cause::QueuePressure);
+  const auto old = ledger.admit(7, group);
+  ledger.reset();
+  const auto fresh = ledger.admit(9, group);
+  const std::vector<BatchRequest> batch{{retired, 4}, {old, 7}, {fresh, 9}};
+  ledger.begin_batch(batch, request_of);
+  ledger.complete_batch(batch, 13, request_of, size_of);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.accepted.requests, 1u);
+  EXPECT_EQ(s.confirmed_written_bytes, 2u);
+  EXPECT_EQ(s.connection_loss.aborted_during_write.bytes, 9u);
+  EXPECT_EQ(ledger.snapshot(group).confirmed_written_bytes, 2u);
+  expect_conservation(s);
+  expect_conservation(ledger.snapshot(group));
+}
+
+TEST(SendAccountingTest, BatchStopCompletionRaceKeepsOneOutcomeAndReplacement) {
+  for (int round = 0; round < 100; ++round) {
+    Ledger ledger;
+    const std::vector<BatchRequest> batch{{ledger.admit(4), 4}, {ledger.admit(7), 7}, {ledger.admit(9), 9}};
+    ledger.begin_batch(batch, request_of);
+    std::thread complete([&] { ledger.complete_batch(batch, 20, request_of, size_of); });
+    std::thread stop([&] { ledger.end(Cause::ExplicitStop); });
+    complete.join();
+    stop.join();
+    const auto s = ledger.snapshot();
+    EXPECT_TRUE(s.written.requests == 3u || s.explicit_stop.aborted_during_write.requests == 3u);
+    EXPECT_EQ(s.outstanding.requests, 0u);
+    expect_conservation(s);
+    const auto replacement = ledger.admit(11);
+    ledger.begin_batch(batch, request_of);
+    ledger.complete_batch(batch, 20, request_of, size_of);
+    EXPECT_EQ(ledger.snapshot().outstanding.bytes, 11u);
+    ledger.complete(replacement, 11);
+    expect_conservation(ledger.snapshot());
+  }
+}
+
+TEST(SendAccountingTest, EmptyBatchAndBatchBeginKeepQueuedStopDistinct) {
+  Ledger ledger;
+  const std::vector<BatchRequest> empty;
+  ledger.begin_batch(empty, request_of);
+  ledger.complete_batch(empty, 0, request_of, size_of);
+  const std::vector<BatchRequest> active{{ledger.admit(4), 4}, {ledger.admit(7), 7}};
+  ledger.admit(9);
+  ledger.begin_batch(active, request_of);
+  ledger.end(Cause::ExplicitStop);
+  ledger.complete_batch(active, 11, request_of, size_of);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.explicit_stop.aborted_during_write.bytes, 11u);
+  EXPECT_EQ(s.explicit_stop.discarded_before_write.bytes, 9u);
+  expect_conservation(s);
+}
+
+// Handoff is fenced by the ledger itself: a batch terminated by stop/loss is
+// refused whole, and out-of-order removal leaves later requests reachable.
+TEST(SendAccountingTest, BatchBeginRefusesTerminatedRequestsAndSurvivesOutOfOrderRemoval) {
+  Ledger ledger;
+  const std::vector<BatchRequest> stopped{{ledger.admit(3), 3}, {ledger.admit(5), 5}};
+  ledger.end(Cause::ConnectionLoss);
+  EXPECT_FALSE(ledger.begin_batch(stopped, request_of));
+
+  const auto first = ledger.admit(7);
+  const auto middle = ledger.admit(11);
+  const auto last = ledger.admit(13);
+  ledger.discard(middle, Cause::QueuePressure);
+  EXPECT_TRUE(ledger.contains(first));
+  EXPECT_FALSE(ledger.contains(middle));
+  EXPECT_TRUE(ledger.contains(last));
+  const std::vector<BatchRequest> mixed{{first, 7}, {middle, 11}};
+  EXPECT_FALSE(ledger.begin_batch(mixed, request_of));
+  EXPECT_FALSE(ledger.contains(0));
+  EXPECT_FALSE(ledger.contains(last + 1));
+
+  const std::vector<BatchRequest> live{{first, 7}, {last, 13}};
+  EXPECT_TRUE(ledger.begin_batch(live, request_of));
+  ledger.complete_batch(live, 20, request_of, size_of);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.bytes, 20u);
+  EXPECT_EQ(s.queue_pressure.discarded_before_write.bytes, 11u);
+  EXPECT_EQ(s.connection_loss.discarded_before_write.bytes, 8u);
+  EXPECT_EQ(s.outstanding.requests, 0u);
+  expect_conservation(s);
+}
+
+TEST(SendAccountingTest, OldestOutstandingRequestSurvivesLaterRetirementAndEnd) {
+  Ledger ledger;
+  const auto oldest = ledger.admit(2);
+  std::vector<Ledger::Request> later;
+  for (int i = 0; i < 1000; ++i) later.push_back(ledger.admit(1));
+  for (const auto id : later) ledger.complete(id, 1);
+  EXPECT_TRUE(ledger.contains(oldest));
+  EXPECT_FALSE(ledger.contains(later.back()));
+  ledger.complete(later.front(), 1);  // A late completion of a retired ID changes nothing.
+
+  ledger.end(Cause::ExplicitStop);
+  EXPECT_FALSE(ledger.contains(oldest));
+  const auto replacement = ledger.admit(3);
+  EXPECT_GT(replacement, later.back());
+  EXPECT_TRUE(ledger.contains(replacement));
+  EXPECT_FALSE(ledger.contains(replacement + 1));
+  ledger.complete(oldest, 2);
+  ledger.complete(replacement, 3);
+
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.requests, 1001u);
+  EXPECT_EQ(s.written.bytes, 1003u);
+  EXPECT_EQ(s.explicit_stop.discarded_before_write.bytes, 2u);
+  EXPECT_EQ(s.outstanding.requests, 0u);
+  expect_conservation(s);
+}
+
+TEST(SendAccountingTest, SlidingWindowKeepsIdentityAcrossWrapAndGrowth) {
+  Ledger ledger;
+  std::deque<Ledger::Request> window;
+  size_t written = 0;
+  // Retire the oldest request each step, then widen the window while slots wrap.
+  for (size_t step = 0; step < 300; ++step) {
+    window.push_back(ledger.admit(step % 7 + 1));
+    if (window.size() > (step < 150 ? 12u : 40u)) {
+      const auto id = window.front();
+      window.pop_front();
+      ledger.complete(id, 7);
+      EXPECT_FALSE(ledger.contains(id));
+      ++written;
+    }
+    for (const auto id : window) ASSERT_TRUE(ledger.contains(id));
+  }
+  ledger.discard(window[window.size() / 2], Cause::QueuePressure);
+  ledger.end(Cause::ConnectionLoss);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.requests, written);
+  EXPECT_EQ(s.queue_pressure.discarded_before_write.requests, 1u);
+  EXPECT_EQ(s.connection_loss.discarded_before_write.requests, window.size() - 1);
+  EXPECT_EQ(s.outstanding.requests, 0u);
+  expect_conservation(s);
+}
+
+TEST(SendAccountingTest, DetachedRequestsPreserveGroupsEpochsAndGatherPrefixes) {
+  Ledger ledger;
+  const auto old_group = std::make_shared<Ledger::Group>();
+  const auto oldest = ledger.admit(4, old_group);
+  ASSERT_TRUE(ledger.begin(oldest));
+  ledger.reset();
+  const auto group = std::make_shared<Ledger::Group>();
+  const auto waiting = ledger.admit(5, group);
+  const auto active = ledger.admit(6, group);
+  ASSERT_TRUE(ledger.begin(active));
+  // Keep the older requests alive while more recent IDs retire.
+  for (int i = 0; i < 64; ++i) ledger.complete(ledger.admit(1), 1);
+  ledger.discard_waiting(group, Cause::SessionExpiry);
+  EXPECT_FALSE(ledger.contains(waiting));
+  EXPECT_TRUE(ledger.contains(oldest));
+  EXPECT_TRUE(ledger.contains(active));
+  const auto newest = ledger.admit(7, group);
+  const std::vector<Ledger::Request> refused{oldest, waiting, newest};
+  EXPECT_FALSE(ledger.begin_batch(refused, [](auto id) { return id; }));
+  struct Item {
+    Ledger::Request id;
+    size_t size;
+  };
+  const std::vector<Item> batch{{oldest, 4}, {active, 6}, {newest, 7}};
+  ASSERT_TRUE(ledger.begin_batch(batch, [](const auto& x) { return x.id; }));
+  ledger.complete_batch(batch, 6, [](const auto& x) { return x.id; }, [](const auto& x) { return x.size; });
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.requests, 64u);
+  EXPECT_EQ(s.outstanding.requests, 0u);
+  EXPECT_EQ(s.confirmed_written_bytes, 66u);
+  const auto peer = ledger.snapshot(group);
+  EXPECT_EQ(peer.session_expiry.discarded_before_write.bytes, 5u);
+  EXPECT_EQ(peer.connection_loss.aborted_during_write.bytes, 13u);
+  EXPECT_EQ(peer.confirmed_written_bytes, 2u);
+  EXPECT_EQ(ledger.snapshot(old_group).accepted.requests, 0u);
+  ledger.complete(oldest, 4);
+  ledger.end(Cause::ExplicitStop);
+  expect_conservation(ledger.snapshot());
+  expect_conservation(peer);
+}
+
+TEST(SendAccountingTest, DetachedRequestsKeepFirstTerminationAndNewIdentity) {
+  Ledger ledger;
+  const auto active = ledger.admit(2);
+  const auto waiting = ledger.admit(3);
+  ASSERT_TRUE(ledger.begin(active));
+  for (int i = 0; i < 64; ++i) ledger.complete(ledger.admit(1), 1);
+  ledger.discard(waiting, Cause::QueuePressure);
+  ledger.end(Cause::ExplicitStop);
+  const auto replacement = ledger.admit(5);
+  ledger.complete(active, 2);
+  ledger.complete(waiting, 3);
+  EXPECT_TRUE(ledger.contains(replacement));
+  ledger.complete(replacement, 5);
+  const auto s = ledger.snapshot();
+  EXPECT_EQ(s.written.requests, 65u);
+  EXPECT_EQ(s.queue_pressure.discarded_before_write.bytes, 3u);
+  EXPECT_EQ(s.explicit_stop.aborted_during_write.bytes, 2u);
+  EXPECT_EQ(s.outstanding.requests, 0u);
+  expect_conservation(s);
+}
+
+}  // namespace

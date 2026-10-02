@@ -29,8 +29,6 @@ endif()
 
 if(WIRESTEAD_OS_LABEL)
   set(_wirestead_os "${WIRESTEAD_OS_LABEL}")
-elseif(UNILINK_OS_LABEL)
-  set(_wirestead_os "${UNILINK_OS_LABEL}")
 elseif(APPLE)
   set(_wirestead_os "macos")
 elseif(WIN32)
@@ -60,13 +58,26 @@ elseif(APPLE)
   set(CPACK_DMG_VOLUME_NAME "Wirestead ${PROJECT_VERSION}")
   set(CPACK_DMG_FORMAT "UDZO")
 elseif(UNIX)
-  set(CPACK_GENERATOR "TGZ;DEB;RPM")
+  # No RPM generator. packaging/wirestead.spec is the supported RPM path: it
+  # splits runtime from -devel the way an RPM distribution expects, and it is
+  # built by the distribution's own toolchain rather than by whatever host
+  # happens to run cpack. A CPack RPM produced on Ubuntu carries Ubuntu's glibc
+  # dependencies and would not install on the distributions that use RPM.
+  set(CPACK_GENERATOR "TGZ;DEB")
   set(CPACK_DEBIAN_PACKAGE_MAINTAINER
       "${CPACK_PACKAGE_VENDOR} <${CPACK_PACKAGE_CONTACT}>"
   )
   set(CPACK_DEBIAN_PACKAGE_SECTION "libs")
   set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+  # This package ships the headers as well as the shared library, and those
+  # headers include boost/asio, so a consumer needs Boost's headers to compile
+  # against it - libboost-dev. libboost-system-dev comes too because
+  # wiresteadConfig.cmake calls find_dependency(Boost COMPONENTS system) and
+  # that needs the component's CMake files. libwirestead.so links no Boost
+  # library of its own; Asio and Boost.System have been header-only since 1.69.
+  # These are the same two keys package.xml declares.
   set(_wirestead_debian_package_depends
+      "libboost-dev (>= ${WIRESTEAD_MIN_BOOST_VERSION})"
       "libboost-system-dev (>= ${WIRESTEAD_MIN_BOOST_VERSION})"
   )
   if(NOT WIRESTEAD_SPDLOG_BUNDLED)
@@ -79,32 +90,13 @@ elseif(UNIX)
   )
   set(CPACK_DEBIAN_PACKAGE_SUGGESTS "cmake, pkg-config")
   set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "libc6-dev")
-  set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
-  set(CPACK_RPM_PACKAGE_GROUP "Development/Libraries")
-  set(CPACK_RPM_PACKAGE_URL "${CPACK_PACKAGE_HOMEPAGE_URL}")
-  set(_wirestead_rpm_package_requires
-      "boost-system >= ${WIRESTEAD_MIN_BOOST_VERSION}"
-  )
-  if(NOT WIRESTEAD_SPDLOG_BUNDLED)
-    list(APPEND _wirestead_rpm_package_requires
-         "spdlog-devel >= ${WIRESTEAD_MIN_SPDLOG_VERSION}"
-    )
-  endif()
-  string(JOIN ", " CPACK_RPM_PACKAGE_REQUIRES
-         ${_wirestead_rpm_package_requires}
-  )
-  set(CPACK_RPM_PACKAGE_SUGGESTS "cmake, pkg-config")
-  set(CPACK_RPM_PACKAGE_RECOMMENDS "glibc-devel")
 
   if(_wirestead_processor_lower MATCHES "x86_64|amd64|x64")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
-    set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
   elseif(_wirestead_processor_lower MATCHES "i[3-6]86")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "i386")
-    set(CPACK_RPM_PACKAGE_ARCHITECTURE "i386")
   elseif(_wirestead_processor_lower MATCHES "aarch64|arm64")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
-    set(CPACK_RPM_PACKAGE_ARCHITECTURE "aarch64")
   endif()
 endif()
 
@@ -168,17 +160,6 @@ if(WIRESTEAD_ENABLE_INSTALL)
     COMPATIBILITY SameMajorVersion
   )
 
-  configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/UnilinkConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/unilinkConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/unilink
-  )
-  write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/unilinkConfigVersion.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-  )
-
   if(WIRESTEAD_ENABLE_PKGCONFIG)
     set(PKGCONFIG_REQUIRES "")
     file(RELATIVE_PATH WIRESTEAD_PKGCONFIG_PREFIX_FROM_PCFILEDIR
@@ -195,10 +176,6 @@ if(WIRESTEAD_ENABLE_INSTALL)
     configure_file(
       ${CMAKE_CURRENT_SOURCE_DIR}/cmake/wirestead.pc.in
       ${CMAKE_CURRENT_BINARY_DIR}/wirestead.pc @ONLY
-    )
-    configure_file(
-      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/unilink.pc.in
-      ${CMAKE_CURRENT_BINARY_DIR}/unilink.pc @ONLY
     )
   endif()
 endif()
@@ -256,15 +233,6 @@ if(WIRESTEAD_ENABLE_INSTALL)
     PATTERN "*.h"
   )
 
-  install(
-    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/unilink/
-    COMPONENT headers
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/unilink
-    FILES_MATCHING
-    PATTERN "*.hpp"
-    PATTERN "*.h"
-  )
-
   if(WIRESTEAD_ENABLE_EXPORT_HEADER)
     install(
       FILES ${CMAKE_CURRENT_BINARY_DIR}/wirestead_export.hpp
@@ -287,21 +255,9 @@ if(WIRESTEAD_ENABLE_INSTALL)
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/wirestead
   )
 
-  install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/unilinkConfig.cmake
-          ${CMAKE_CURRENT_BINARY_DIR}/unilinkConfigVersion.cmake
-    COMPONENT cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/unilink
-  )
-
   if(WIRESTEAD_ENABLE_PKGCONFIG)
     install(
       FILES ${CMAKE_CURRENT_BINARY_DIR}/wirestead.pc
-      COMPONENT pkgconfig
-      DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
-    )
-    install(
-      FILES ${CMAKE_CURRENT_BINARY_DIR}/unilink.pc
       COMPONENT pkgconfig
       DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig
     )

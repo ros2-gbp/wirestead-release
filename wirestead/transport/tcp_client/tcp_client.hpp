@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,9 +28,10 @@
 #include "wirestead/base/visibility.hpp"
 #include "wirestead/config/tcp_client_config.hpp"
 #include "wirestead/diagnostics/error_types.hpp"
-#include "wirestead/interface/channel.hpp"
+#include "wirestead/interface/result_channel.hpp"
 #include "wirestead/memory/memory_pool.hpp"
 #include "wirestead/transport/base/reconnect_policy.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 // Forward declare boost components
 namespace boost {
@@ -39,14 +41,20 @@ class io_context;
 }  // namespace boost
 
 namespace wirestead {
+namespace wrapper {
+class TcpClient;
+}  // namespace wrapper
 namespace transport {
+namespace detail {
+struct TcpWriteWait;
+}
 
 using base::LinkState;
 using config::TcpClientConfig;
 using interface::Channel;
 
 // Use static create() helpers to construct safely
-class WIRESTEAD_API TcpClient : public Channel, public std::enable_shared_from_this<TcpClient> {
+class WIRESTEAD_API TcpClient : public interface::ResultChannel, public std::enable_shared_from_this<TcpClient> {
  public:
   using BufferVariant =
       std::variant<memory::PooledBuffer, std::vector<uint8_t>, std::shared_ptr<const std::vector<uint8_t>>>;
@@ -67,16 +75,19 @@ class WIRESTEAD_API TcpClient : public Channel, public std::enable_shared_from_t
   void stop() override;
   bool is_connected() const override;
   bool is_backpressure_active() const override;
+  std::optional<size_t> write_queue_limit() const override;
   wrapper::RuntimeStats stats() const override;
   void reset_stats() override;
   boost::asio::any_io_executor get_executor() override;
 
-  bool async_write_copy(memory::ConstByteSpan data) override;
-  bool async_write_move(std::vector<uint8_t>&& data) override;
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
-  bool async_try_write_copy(memory::ConstByteSpan data) override;
-  bool async_try_write_move(std::vector<uint8_t>&& data) override;
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_copy_result(memory::ConstByteSpan data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] wrapper::SendResult async_try_write_shared_result(
+      std::shared_ptr<const std::vector<uint8_t>> data) override;
 
   // Thread-safe: may be called at any time, including after start(). Each
   // setter takes effect for subsequent operations (callback replacement is
@@ -99,6 +110,25 @@ class WIRESTEAD_API TcpClient : public Channel, public std::enable_shared_from_t
   void set_reconnect_policy(ReconnectPolicy policy);
 
  private:
+  // The built-in wrapper pins capacity waits without extending Channel's ABI.
+  friend class wrapper::TcpClient;
+  void fail_receive();
+  std::optional<uint64_t> write_connection() const;
+  std::shared_ptr<detail::TcpWriteWait> capture_write_wait() const;
+  std::optional<wrapper::SendResult> poll_write_wait(const std::shared_ptr<detail::TcpWriteWait>& wait) const;
+  void cancel_write_waits();
+  wrapper::SendResult write_state();
+  // Native admission only: wrapper lifecycle, validation precedence and
+  // strategy-level reason mapping remain the wrapper's responsibility.
+  wrapper::SendResult write_copy(memory::ConstByteSpan data, std::optional<uint64_t> expected_connection);
+  wrapper::SendResult write_move(std::vector<uint8_t>&& data, std::optional<uint64_t> expected_connection);
+  wrapper::SendResult write_shared(std::shared_ptr<const std::vector<uint8_t>> data,
+                                   std::optional<uint64_t> expected_connection);
+
+  wrapper::SendResult try_write_copy(memory::ConstByteSpan data);
+  wrapper::SendResult try_write_move(std::vector<uint8_t>&& data);
+  wrapper::SendResult try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data);
+
   explicit TcpClient(const TcpClientConfig& cfg);
   explicit TcpClient(const TcpClientConfig& cfg, boost::asio::io_context& ioc);
 
