@@ -27,6 +27,7 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/strand.hpp>
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -36,10 +37,18 @@
 #include <vector>
 
 #include "wirestead/base/common.hpp"
+#include "wirestead/config/validation.hpp"
 #include "wirestead/factory/channel_factory.hpp"
+#include "wirestead/interface/connection_channel.hpp"
+#include "wirestead/transport/udp/detail/write_wait.hpp"
 #include "wirestead/transport/udp/udp.hpp"
+#include "wirestead/util/input_validator.hpp"
+#include "wirestead/wrapper/bounded_receive.hpp"
 #include "wirestead/wrapper/callback_guard.hpp"
 #include "wirestead/wrapper/error_context_builder.hpp"
+#include "wirestead/wrapper/lifecycle_events.hpp"
+#include "wirestead/wrapper/send_retry.hpp"
+#include "wirestead/wrapper/send_validation.hpp"
 
 namespace wirestead {
 namespace wrapper {
@@ -48,6 +57,34 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
   mutable std::shared_mutex mutex_;
   std::mutex bp_mutex_;
   std::condition_variable bp_cv_;
+  // D-1: admission gate for this object's user callbacks. Admission, the
+  // running count and the closed flag are one decision, so a stop() cannot
+  // observe an empty gate while a callback is about to start, and a callback
+  // left over from a previous run is refused after a restart.
+  detail::CallbackGate callback_gate_;
+  std::mutex stop_finalize_mutex_;
+  bool stop_requested_ = false;
+  std::atomic<unsigned> stop_callers_{0};
+  std::atomic<uint64_t> callback_generation_{0};
+
+  // True when this thread is one the target's shutdown needs: a callback of
+  // this object, or any thread currently running the external io_context this
+  // channel was built on (which a callback of another channel sharing it is).
+  // Such a caller requests the shutdown and returns; it cannot wait for work
+  // its own thread has to perform.
+  bool shutdown_needs_this_thread() const {
+    if (callback_gate_.active_on_this_thread()) return true;
+    if (external_ioc && external_ioc->get_executor().running_in_this_thread()) return true;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!channel) return false;
+    const auto executor = channel->get_executor();
+    using IoExecutor = boost::asio::io_context::executor_type;
+    if (auto* io = executor.target<IoExecutor>()) return io->running_in_this_thread();
+    if (auto* strand = executor.target<boost::asio::strand<IoExecutor>>())
+      return strand->get_inner_executor().running_in_this_thread();
+    return false;
+  }
+
   config::UdpConfig cfg;
   std::shared_ptr<interface::Channel> channel;
   std::shared_ptr<boost::asio::io_context> external_ioc;
@@ -71,9 +108,19 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
 
   std::shared_ptr<framer::IFramer> framer{nullptr};
 
+  detail::LifecycleEvents lifecycle_events_;
+  void require_stopped_config() const {
+    if (started_.load() || stop_callers_.load() || (stop_requested_ && alive_marker) || detail::in_data_callback())
+      throw std::logic_error("configuration requires completed stop");
+  }
+  ReceiveLimits receive_limits_;
+  std::shared_ptr<detail::ReceiveBudget> receive_budget_{std::make_shared<detail::ReceiveBudget>(receive_limits_)};
+  std::shared_ptr<detail::ReceiveState> receive_state_{
+      std::make_shared<detail::ReceiveState>(receive_budget_->open_scope())};
+
   // Batching logic
-  std::vector<MessageContext> data_batch_queue_;
-  std::vector<MessageContext> message_batch_queue_;
+  detail::ReceiveBatch data_batch_queue_;
+  detail::ReceiveBatch message_batch_queue_;
   std::unique_ptr<boost::asio::steady_timer> batch_timer_;
   size_t max_batch_size_ = 100;
   std::chrono::milliseconds max_batch_latency_{1};
@@ -93,6 +140,10 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
   Impl(const config::UdpConfig& config, std::shared_ptr<boost::asio::io_context> ioc)
       : cfg(config), external_ioc(std::move(ioc)), use_external_context(external_ioc != nullptr) {}
   explicit Impl(std::shared_ptr<interface::Channel> ch) : channel(std::move(ch)), factory_managed_channel_(false) {
+    if (!std::dynamic_pointer_cast<transport::UdpChannel>(channel) &&
+        !std::dynamic_pointer_cast<interface::ConnectionChannel>(channel))
+      throw std::invalid_argument("UdpClient requires its native transport or a ConnectionChannel");
+
     // #450: setup_internal_handlers() captures weak_from_this() - calling it
     // from inside this constructor would capture an empty weak_ptr, since
     // enable_shared_from_this isn't wired up until make_shared() finishes
@@ -117,7 +168,13 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
     pending_promises.clear();
   }
 
-  void flush_batches() {
+  void flush_batches(uint64_t generation) {
+    auto lease = callback_gate_.enter(generation);
+    if (!lease.admitted()) return;
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+      if (data_batch_queue_.empty() && message_batch_queue_.empty()) return;
+    }
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!data_batch_queue_.empty()) {
       auto handler = data_batch_handler_;
@@ -129,6 +186,7 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
         lock.lock();
       }
     }
+    if (!callback_gate_.enter(generation).admitted()) return;
     if (!message_batch_queue_.empty()) {
       auto handler = message_batch_handler_;
       auto batch = std::move(message_batch_queue_);
@@ -144,22 +202,23 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
     }
   }
 
-  void schedule_batch_timer() {
+  void schedule_batch_timer(uint64_t generation) {
     if (!batch_timer_) return;
     batch_timer_->expires_after(max_batch_latency_);
-    batch_timer_->async_wait([this, weak_impl = weak_from_this(),
+    batch_timer_->async_wait([this, generation, weak_impl = weak_from_this(),
                               weak_alive = std::weak_ptr<bool>(alive_marker)](const boost::system::error_code& ec) {
       if (ec) return;
       auto impl_keepalive = weak_impl.lock();
       if (!impl_keepalive) return;
       auto alive = weak_alive.lock();
       if (!alive) return;
-      flush_batches();
+      flush_batches(generation);
     });
   }
 
   std::future<bool> start() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    stop_requested_ = false;
     if (channel && channel->is_connected()) {
       started_.store(true);
       std::promise<bool> p;
@@ -175,14 +234,16 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
       return future;
     }
 
+    if (!alive_marker) alive_marker = std::make_shared<bool>(true);
     if (!channel) {
       channel = factory::ChannelFactory::create(cfg, external_ioc);
-      setup_internal_handlers();
     }
+    setup_internal_handlers();
     started_.store(true);
 
+    auto channel_copy = channel;
     lock.unlock();
-    channel->start();
+    channel_copy->start();
     if (use_external_context && manage_external_context && !external_thread.joinable()) {
       if (external_ioc->stopped()) external_ioc->restart();
       work_guard = std::make_unique<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>>(
@@ -199,134 +260,132 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
   }
 
   void stop() {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!started_.load()) {
+    stop_callers_.fetch_add(1);
+    struct StopCall {
+      std::atomic<unsigned>& callers;
+      ~StopCall() { callers.fetch_sub(1); }
+    } stop_call{stop_callers_};
+    const bool request_only = shutdown_needs_this_thread();
+    callback_gate_.close();
+    std::shared_ptr<interface::Channel> channel_copy;
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      stop_requested_ = true;
+      if (auto udp = std::dynamic_pointer_cast<transport::UdpChannel>(channel)) udp->cancel_write_waits();
+      if (auto custom = std::dynamic_pointer_cast<interface::ConnectionChannel>(channel)) custom->cancel_write_waits();
+      started_.store(false);
+
+      bp_cv_.notify_all();
       fulfill_all_locked(false);
-      return;
+      channel_copy = channel;
     }
-    started_.store(false);
-    bp_cv_.notify_all();
+    if (channel_copy) channel_copy->stop();
+    if (request_only) return;
 
-    if (batch_timer_) {
-      batch_timer_->cancel();
-      batch_timer_.reset();
-    }
-
-    if (channel) {
-      lock.unlock();
-      channel->stop();
-      // Clear callbacks after stop() rather than before: the transport-level
-      // fix (#436) already synchronizes callback reads against these
-      // setters, but clearing after stop() means no in-flight handler can
-      // observe a null callback mid-shutdown in the first place - belt and
-      // braces once the underlying race is fixed at the source.
-      channel->on_bytes(nullptr);
-      channel->on_state(nullptr);
-      channel->on_backpressure(nullptr);
-      lock.lock();
-      if (factory_managed_channel_) {
-        // Fully release the channel rather than reusing it: start()'s
-        // `if (!channel)` guard is what re-runs setup_internal_handlers() and
-        // rebuilds config from the (possibly changed) staged fields. Reusing
-        // a stopped channel left every handler nulled forever - including
-        // the one that fulfills the start() future - so a restart would
-        // hang (jwsung91/wirestead#444). Injected channels (factory_managed_
-        // channel_ == false) are exempt: the caller owns that channel's
-        // identity, so we must not discard and factory-rebuild it.
-        channel.reset();
+    callback_gate_.wait_until_idle();
+    std::lock_guard<std::mutex> finalize_lock(stop_finalize_mutex_);
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex_);
+      alive_marker.reset();
+      if (batch_timer_) {
+        batch_timer_->cancel();
+        batch_timer_.reset();
       }
-    }
 
-    if (work_guard) {
+      if (channel) {
+        channel->on_bytes(nullptr);
+        channel->on_state(nullptr);
+        channel->on_backpressure(nullptr);
+      }
+      if (factory_managed_channel_) channel.reset();
+      data_batch_queue_.clear();
+      message_batch_queue_.clear();
+      receive_state_->reset(framer.get());
+    }
+    if (use_external_context && manage_external_context) {
       work_guard.reset();
+      if (external_ioc) external_ioc->stop();
+      if (external_thread.joinable()) external_thread.join();
     }
+  }
 
-    if (use_external_context && manage_external_context && external_thread.joinable()) {
-      if (external_ioc) {
-        external_ioc->stop();
+  // Caller holds mutex_. Native readiness remains part of transport admission.
+  SendResult send_state(const std::shared_ptr<transport::UdpChannel>& udp, bool custom = false) {
+    if (stop_callers_.load() != 0) return SendResult::reject(SendRejection::Stopping);
+    if (!started_.load()) {
+      if (stop_requested_) {
+        if (!callback_gate_.idle()) return SendResult::reject(SendRejection::Stopping);
+        if (udp) {
+          const auto state = udp->write_state();
+          if (!state.accepted() && state.reason() == SendRejection::Stopping) return state;
+        }
       }
-      if (std::this_thread::get_id() != external_thread.get_id()) {
-        lock.unlock();
-        external_thread.join();
-        lock.lock();
-      } else {
-        external_thread.detach();
-      }
+      return SendResult::reject(SendRejection::NotStarted);
     }
-
-    fulfill_all_locked(false);
-
-    if (framer) {
-      framer->reset();
-    }
+    if (!udp && !custom) return SendResult::reject(SendRejection::NotReady);
+    return SendResult::accept();
   }
 
-  bool send(std::string_view data) {
-    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) return send_blocking(data);
-    return try_send(data);
+  static SendResult finish_send(SendResult result) {
+    if (auto hook = detail::g_udp_send_result_hook.load()) hook(result);
+    return result;
   }
 
-  // #509: wait_for_backpressure_clear()'s condition and the transport's own
-  // hard queue-byte cap are different thresholds observed at different
-  // times, so a single write attempt can spuriously fail right after the
-  // wait exits. Bounded retry rather than unbounded, so a payload that can
-  // never fit still fails in bounded time. If a single write is rejected
-  // because the payload alone exceeds the transport's cap, UdpChannel also
-  // transitions to LinkState::Error (unlike TCP/UDS) - wait_for_backpressure_
-  // clear()'s own is_connected() check catches that and ends the retry loop
-  // after one real attempt, so this doesn't retry into a broken channel.
-  static constexpr int kMaxBlockingSendAttempts = 5;
-
-  bool send_move(std::vector<uint8_t>&& data) {
-    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) {
-      for (int attempt = 0; attempt < kMaxBlockingSendAttempts; ++attempt) {
-        std::unique_lock<std::mutex> bp_lock(bp_mutex_);
-        if (!wait_for_backpressure_clear(bp_lock)) return false;
-        bp_lock.unlock();
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        if (!started_.load() || !channel || !channel->is_connected()) return false;
-        if (channel->async_write_move(std::move(data))) return true;
-      }
-      return false;
-    }
-    return try_send_move(std::move(data));
+  template <typename NativeWrite, typename CustomWrite>
+  SendResult nonblocking_send(size_t size, bool best_effort_send, NativeWrite native_write, CustomWrite custom_write) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto udp = std::dynamic_pointer_cast<transport::UdpChannel>(channel);
+    auto custom = udp ? nullptr : std::dynamic_pointer_cast<interface::ConnectionChannel>(channel);
+    const auto result = [&]() -> SendResult {
+      auto validation = detail::validate_payload_size(size, channel ? channel->write_queue_limit() : std::nullopt);
+      if (!validation.accepted()) return validation;
+      const auto state = send_state(udp, custom != nullptr);
+      if (!state.accepted()) return state;
+      // Admission rechecks state and capacity together under the channel lock.
+      auto admitted = custom ? custom_write(*custom) : native_write(*udp);
+      if (best_effort_send && !admitted.accepted() && admitted.reason() == SendRejection::WouldBlock)
+        return SendResult::reject(SendRejection::QueueFull);
+      return admitted;
+    }();
+    lock.unlock();
+    return finish_send(result);
   }
 
-  bool send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-    if (!data || data->empty()) return false;
-    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) {
-      for (int attempt = 0; attempt < kMaxBlockingSendAttempts; ++attempt) {
-        std::unique_lock<std::mutex> bp_lock(bp_mutex_);
-        if (!wait_for_backpressure_clear(bp_lock)) return false;
-        bp_lock.unlock();
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        if (!started_.load() || !channel || !channel->is_connected()) return false;
-        if (channel->async_write_shared(data)) return true;
-      }
-      return false;
-    }
-    return try_send_shared(std::move(data));
-  }
-
-  bool send_line(std::string_view line) {
-    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) return send_line_blocking(line);
-    return try_send_line(line);
-  }
-
-  bool try_send_line(std::string_view line) { return try_send(std::string(line) + "\n"); }
-
-  bool send_blocking(std::string_view data) {
+  SendResult try_send(std::string_view data, bool best_effort_send = false) {
     auto binary_view = base::safe_convert::string_to_bytes(data);
     memory::ConstByteSpan span(binary_view.first, binary_view.second);
-    for (int attempt = 0; attempt < kMaxBlockingSendAttempts; ++attempt) {
-      std::unique_lock<std::mutex> bp_lock(bp_mutex_);
-      if (!wait_for_backpressure_clear(bp_lock)) return false;
-      bp_lock.unlock();
-      std::shared_lock<std::shared_mutex> lock(mutex_);
-      if (!started_.load() || !channel || !channel->is_connected()) return false;
-      if (channel->async_write_copy(span)) return true;
-    }
-    return false;
+    return nonblocking_send(
+        data.size(), best_effort_send, [&](auto& udp) { return udp.try_write_copy(span); },
+        [&](auto& channel) { return channel.async_try_write_copy_result(span); });
+  }
+
+  SendResult try_send_move(std::vector<uint8_t>&& data, bool best_effort_send = false) {
+    return nonblocking_send(
+        data.size(), best_effort_send, [&](auto& udp) { return udp.try_write_move(std::move(data)); },
+        [&](auto& channel) { return channel.async_try_write_move_result(std::move(data)); });
+  }
+
+  SendResult try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data, bool best_effort_send = false) {
+    return nonblocking_send(
+        data ? data->size() : 0, best_effort_send, [&](auto& udp) { return udp.try_write_shared(std::move(data)); },
+        [&](auto& channel) { return channel.async_try_write_shared_result(std::move(data)); });
+  }
+
+  SendResult send(std::string_view data) {
+    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) return send_blocking(data);
+    return try_send(data, true);
+  }
+
+  struct ConnectionPin {
+    bool cannot_wait = false;
+    std::shared_ptr<interface::ConnectionChannel> custom;
+    interface::ConnectionChannel::Connection custom_wait;
+    std::shared_ptr<transport::UdpChannel> udp;
+    std::shared_ptr<transport::detail::UdpWriteWait> wait;
+  };
+
+  bool connection_matches(const ConnectionPin& pin) const {
+    return !pin.udp || (pin.wait && pin.udp->write_connection() == pin.wait->sequence);
   }
 
   // channel->on_backpressure() calls bp_cv_.notify_all() from the transport's io_context
@@ -335,52 +394,142 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
   // waiter can check the predicate, find it still blocking, and be in the process of
   // registering to wait when the notify fires - in the rare case that race is lost, an
   // unbounded wait() would block forever. Poll with a bounded timeout instead so a missed
-  // notify only costs a short delay rather than a permanent hang (see #427).
+  // notify only costs a short delay rather than a permanent hang (see #427, #431).
   //
-  // Returns false instead of waiting if called from the channel's own io
-  // thread while backpressure is active - e.g. a blocking send() called
-  // from inside an on_data/on_message callback. Clearing backpressure
-  // requires that same io thread to make progress, so blocking here would
-  // deadlock forever rather than eventually clear (#449).
-  bool wait_for_backpressure_clear(std::unique_lock<std::mutex>& bp_lock) {
-    auto predicate = [this] {
+  // Callback scopes cannot wait for capacity: they may be running on the
+  // executor needed to drain their own or another channel's queue (D-2).
+  SendResult wait_for_backpressure_clear(std::unique_lock<std::mutex>& bp_lock, size_t payload_size,
+                                         uint64_t generation, const ConnectionPin& connection) {
+    if (connection.custom_wait) {
+      auto outcome = connection.custom_wait->poll_capacity();
+      if (outcome) return *outcome;
+      if (connection.cannot_wait) return SendResult::reject(SendRejection::WouldBlock);
+      if (auto hook = detail::g_udp_capacity_wait_hook.load()) hook();
+      while (!bp_cv_.wait_for(bp_lock, std::chrono::milliseconds(50), [&] {
+        outcome = connection.custom_wait->poll_capacity();
+        return outcome.has_value();
+      })) {
+      }
+      if (auto hook = detail::g_udp_capacity_wait_result_hook.load()) hook(*outcome);
+      return *outcome;
+    }
+    if (!detail::payload_needs_capacity(payload_size)) return SendResult::accept();
+    auto immediate = [this, payload_size, generation, &connection] {
       std::shared_lock<std::shared_mutex> lock(mutex_);
-      return !started_.load() || !channel || !channel->is_connected() || !channel->is_backpressure_active();
+      return callback_generation_.load() != generation || !started_.load() || !channel || !channel->is_connected() ||
+             !connection_matches(connection) ||
+             !detail::payload_needs_capacity(payload_size, channel->write_queue_limit()) ||
+             !channel->is_backpressure_active();
     };
-    if (predicate()) return true;
-    if (detail::in_data_callback()) return false;
-    while (!bp_cv_.wait_for(bp_lock, std::chrono::milliseconds(50), predicate)) {
+    // A bypass is not a completed capacity wait; final admission checks still apply.
+    if (immediate()) return SendResult::accept();
+    if (connection.cannot_wait) return SendResult::reject(SendRejection::WouldBlock);
+    if (auto hook = detail::g_udp_capacity_wait_hook.load()) hook();
+    std::optional<SendResult> outcome;
+    auto released = [&] {
+      if (outcome) return true;
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+      // The connection record retains the first terminal cause under the
+      // same transport lock used by stop, loss and admission.
+      outcome = connection.udp->poll_write_wait(connection.wait);
+      return outcome.has_value();
+    };
+    while (!bp_cv_.wait_for(bp_lock, std::chrono::milliseconds(50), released)) {
     }
-    return true;
+    if (auto hook = detail::g_udp_capacity_wait_result_hook.load()) hook(*outcome);
+    return *outcome;
   }
 
-  bool try_send(std::string_view data) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (channel && channel->is_connected()) {
-      auto binary_view = base::safe_convert::string_to_bytes(data);
-      return channel->async_try_write_copy(memory::ConstByteSpan(binary_view.first, binary_view.second));
-    }
-    return false;
+  // #509: high-water pressure and hard-limit reservations are different
+  // thresholds. Capacity can be refilled between a wait and admission, so
+  // retry transient native WouldBlock until admission or cancellation. Validation and
+  // terminal state failures return immediately.
+
+  template <typename NativeWrite, typename CustomWrite>
+  SendResult blocking_send(size_t size, NativeWrite native_write, CustomWrite custom_write) {
+    uint64_t generation;
+    ConnectionPin connection;
+    const auto result = [&]() -> SendResult {
+      {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        // Select the run and native connection together at entry. Validation
+        // precedes state and waiting, including the line delimiter and hard cap.
+        generation = callback_generation_.load();
+        connection.cannot_wait =
+            detail::in_data_callback() || (channel && detail::executor_running_here(channel->get_executor()));
+        connection.udp = std::dynamic_pointer_cast<transport::UdpChannel>(channel);
+        connection.custom = connection.udp ? nullptr : std::dynamic_pointer_cast<interface::ConnectionChannel>(channel);
+        auto validation = detail::validate_payload_size(size, channel ? channel->write_queue_limit() : std::nullopt);
+        if (!validation.accepted()) return validation;
+        auto state = send_state(connection.udp, connection.custom != nullptr);
+        if (!state.accepted()) return state;
+        if (connection.custom) {
+          auto captured = connection.custom->capture_write_connection();
+          if (auto reason = std::get_if<SendRejection>(&captured)) return SendResult::reject(*reason);
+          connection.custom_wait = std::get<interface::ConnectionChannel::Connection>(std::move(captured));
+          if (!connection.custom_wait) throw std::logic_error("ConnectionChannel returned a null connection");
+        } else {
+          state = connection.udp->write_state();
+          if (!state.accepted()) return state;
+          connection.wait = connection.udp->capture_write_wait();
+          if (!connection.wait) return SendResult::reject(SendRejection::NotReady);
+        }
+      }
+      for (bool retry = false;; retry = true) {
+        if (retry) detail::pause_send_retry(bp_cv_, bp_mutex_);
+        std::unique_lock<std::mutex> bp_lock(bp_mutex_);
+        const auto released = wait_for_backpressure_clear(bp_lock, size, generation, connection);
+        if (!released.accepted()) return released;  // Never overwrite the cause of release.
+        bp_lock.unlock();
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        const auto state = send_state(connection.udp, connection.custom != nullptr);
+        if (!state.accepted()) return state;
+        if (callback_generation_.load() != generation) return SendResult::reject(SendRejection::NotReady);
+        const auto admitted = connection.custom_wait ? custom_write(*connection.custom_wait)
+                                                     : native_write(*connection.udp, connection.wait->sequence);
+        if (admitted.accepted() || admitted.reason() != SendRejection::WouldBlock) return admitted;
+        // Only transient capacity refusal can be retried, never a terminal
+        // result. Callback callers must return without entering another wait.
+        if (connection.cannot_wait) return admitted;
+      }
+    }();
+    return finish_send(result);
   }
 
-  bool try_send_move(std::vector<uint8_t>&& data) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (channel && channel->is_connected()) {
-      return channel->async_try_write_move(std::move(data));
-    }
-    return false;
+  SendResult send_move(std::vector<uint8_t>&& data) {
+    if (cfg.backpressure_strategy != base::constants::BackpressureStrategy::Reliable)
+      return try_send_move(std::move(data), true);
+    return blocking_send(
+        data.size(), [&](auto& udp, uint64_t sequence) { return udp.write_move(std::move(data), sequence); },
+        [&](auto& connection) { return connection.write_move(std::move(data)); });
   }
 
-  bool try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
-    if (!data || data->empty()) return false;
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (channel && channel->is_connected()) {
-      return channel->async_try_write_shared(std::move(data));
-    }
-    return false;
+  SendResult send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+    if (cfg.backpressure_strategy != base::constants::BackpressureStrategy::Reliable)
+      return try_send_shared(std::move(data), true);
+    return blocking_send(
+        data ? data->size() : 0, [&](auto& udp, uint64_t sequence) { return udp.write_shared(data, sequence); },
+        [&](auto& connection) { return connection.write_shared(data); });
   }
 
-  bool send_line_blocking(std::string_view line) { return send_blocking(std::string(line) + "\n"); }
+  SendResult send_line(std::string_view line) {
+    if (cfg.backpressure_strategy == base::constants::BackpressureStrategy::Reliable) return send_line_blocking(line);
+    return try_send_line(line, true);
+  }
+
+  SendResult try_send_line(std::string_view line, bool best_effort_send = false) {
+    return try_send(std::string(line) + "\n", best_effort_send);
+  }
+
+  SendResult send_blocking(std::string_view data) {
+    auto binary_view = base::safe_convert::string_to_bytes(data);
+    memory::ConstByteSpan span(binary_view.first, binary_view.second);
+    return blocking_send(
+        data.size(), [&](auto& udp, uint64_t sequence) { return udp.write_copy(span, sequence); },
+        [&](auto& connection) { return connection.write_copy(span); });
+  }
+
+  SendResult send_line_blocking(std::string_view line) { return send_blocking(std::string(line) + "\n"); }
 
   RuntimeStats stats() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -389,6 +538,7 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
 
   void reset_stats() {
     std::shared_lock<std::shared_mutex> lock(mutex_);
+    receive_budget_->reset_stats();
     if (channel) channel->reset_stats();
   }
 
@@ -399,12 +549,18 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
 
     std::weak_ptr<bool> weak_alive = alive_marker;
     std::weak_ptr<Impl> weak_impl = weak_from_this();
+    receive_budget_->reset_stats();
+    lifecycle_events_.reset();
+    const auto generation = callback_gate_.open_new_generation();
+    callback_generation_.store(generation);
 
-    channel->on_bytes([this, weak_impl, weak_alive](memory::ConstByteSpan data) {
+    channel->on_bytes([this, generation, weak_impl, weak_alive](memory::ConstByteSpan data) {
       auto impl_keepalive = weak_impl.lock();
       if (!impl_keepalive) return;
       auto alive = weak_alive.lock();
       if (!alive) return;
+      auto lease = callback_gate_.enter(generation);
+      if (!lease.admitted()) return;
 
       // #449: everything below runs synchronously on this io thread - mark
       // it so a blocking send() called from within one of these callbacks
@@ -416,46 +572,57 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
       // level so it no longer blocks concurrent sends even briefly.
       bool batch_mode;
       interface::SharedCallback<MessageHandler> handler;
+      std::shared_ptr<detail::ReceiveState> receive;
       std::shared_ptr<framer::IFramer> framer_to_push;
       {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         batch_mode = static_cast<bool>(data_batch_handler_);
         handler = data_handler;
         framer_to_push = framer;
+        receive = receive_state_;
       }
 
-      if (batch_mode) {
-        // #441: build the copy before taking the exclusive lock, so the
-        // lock is only held for the queue mutation itself, not the
-        // allocation.
-        MessageContext ctx(0, memory::SafeDataBuffer(data));
-        interface::SharedCallback<BatchMessageHandler> flush_handler;
-        std::vector<MessageContext> batch;
-        {
-          std::unique_lock<std::shared_mutex> lock(mutex_);
-          data_batch_queue_.emplace_back(std::move(ctx));
-          if (data_batch_queue_.size() >= max_batch_size_) {
-            flush_handler = data_batch_handler_;
-            batch = std::move(data_batch_queue_);
-            data_batch_queue_.clear();
-          } else if (data_batch_queue_.size() == 1) {
-            schedule_batch_timer();
+      try {
+        auto prepared = detail::prepare_receive(*receive, framer_to_push, 0, data, batch_mode);
+        if (batch_mode) {
+          // #441: build the copy before taking the exclusive lock, so the
+          // lock is only held for the queue mutation itself, not the
+          // allocation.
+          auto ctx = std::move(*prepared.raw);
+          interface::SharedCallback<BatchMessageHandler> flush_handler;
+          detail::ReceiveBatch batch;
+          {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            data_batch_queue_.emplace_back(std::move(ctx));
+            if (data_batch_queue_.size() >= max_batch_size_) {
+              flush_handler = data_batch_handler_;
+              batch = std::move(data_batch_queue_);
+              data_batch_queue_.clear();
+            } else if (data_batch_queue_.size() == 1) {
+              schedule_batch_timer(generation);
+            }
           }
+          detail::invoke_user_callback("udp_client", "on_data_batch", flush_handler, batch);
+        } else {
+          detail::invoke_user_callback("udp_client", "on_data", handler, MessageContext(0, data));
         }
-        detail::invoke_user_callback("udp_client", "on_data_batch", flush_handler, batch);
-      } else {
-        detail::invoke_user_callback("udp_client", "on_data", handler, MessageContext(0, data));
-      }
 
-      if (framer_to_push) framer_to_push->push_bytes(data);
+        prepared.deliver();
+      } catch (const detail::ReceiveOverflow& overflow) {
+        receive->scope->overflow(data.size(), overflow.reason);
+      } catch (const std::bad_alloc&) {
+        receive->scope->overflow(data.size(), ReceiveOverflowReason::AllocationFailure);
+      }
     });
 
-    channel->on_backpressure([this, weak_impl, weak_alive](size_t queued) {
-      bp_cv_.notify_all();
+    channel->on_backpressure([this, generation, weak_impl, weak_alive](size_t queued) {
       auto impl_keepalive = weak_impl.lock();
       if (!impl_keepalive) return;
       auto alive = weak_alive.lock();
       if (!alive) return;
+      auto lease = callback_gate_.enter(generation);
+      if (!lease.admitted()) return;
+      bp_cv_.notify_all();
       std::function<void(size_t)> handler;
       {
         std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -464,53 +631,67 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
       detail::invoke_user_callback("udp_client", "on_backpressure", handler, queued);
     });
 
-    channel->on_state([this, weak_impl, weak_alive](base::LinkState state) {
+    channel->on_state([this, generation, weak_impl, weak_alive](base::LinkState state) {
       auto impl_keepalive = weak_impl.lock();
       if (!impl_keepalive) return;
       auto alive = weak_alive.lock();
       if (!alive) return;
-
-      switch (state) {
-        case base::LinkState::Connected:
-        case base::LinkState::Listening: {
-          ConnectionHandler handler;
-          {
-            std::unique_lock<std::shared_mutex> lock(mutex_);
-            fulfill_all_locked(true);
-            handler = connect_handler;
-          }
-          detail::invoke_user_callback("udp_client", "on_connect", handler, ConnectionContext(0));
-          break;
+      auto lease = callback_gate_.enter(generation);
+      if (!lease.admitted()) return;
+      const bool ready = state == base::LinkState::Connected || state == base::LinkState::Listening;
+      const auto events = lifecycle_events_.observe(state, ready);
+      ConnectionHandler connected_handler, lost_handler;
+      ErrorHandler terminal_handler;
+      std::shared_ptr<interface::Channel> channel_snapshot;
+      if (ready) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        fulfill_all_locked(true);
+        connected_handler = connect_handler;
+      } else {
+        if (state == base::LinkState::Closed || state == base::LinkState::Idle || state == base::LinkState::Error) {
+          std::unique_lock<std::shared_mutex> lock(mutex_);
+          fulfill_all_locked(false);
         }
-        case base::LinkState::Closed:
-        case base::LinkState::Error:
-        case base::LinkState::Idle: {
-          ConnectionHandler disconnect_handler_snapshot;
-          ErrorHandler error_handler_snapshot;
-          {
-            std::unique_lock<std::shared_mutex> lock(mutex_);
-            fulfill_all_locked(false);
-            if (state == base::LinkState::Error) {
-              error_handler_snapshot = error_handler;
-            } else {
-              disconnect_handler_snapshot = disconnect_handler;
-            }
-          }
-          detail::invoke_user_callback("udp_client", "on_disconnect", disconnect_handler_snapshot,
-                                       ConnectionContext(0));
-          detail::invoke_user_callback("udp_client", "on_error", error_handler_snapshot,
-                                       detail::build_error_context(*channel, "Connection error"));
-          break;
+        // A Connecting notification must not require the exclusive wrapper
+        // lock held off by a connection-pinned final admission on another thread.
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        if (events.disconnect) lost_handler = disconnect_handler;
+        if (events.error) {
+          terminal_handler = error_handler;
+          channel_snapshot = channel;
         }
-        default:
-          break;
       }
+      if (events.disconnect) {
+        flush_batches(generation);
+        std::shared_lock<std::shared_mutex> read_lock(mutex_);
+        if (framer) {
+          read_lock.unlock();
+          std::unique_lock<std::shared_mutex> lock(mutex_);
+          receive_state_->reset(framer.get());
+        }
+      }
+      auto notification_lease = callback_gate_.enter(generation);
+      if (!notification_lease.admitted()) return;
+      detail::invoke_user_callback("udp_client", "on_connect", connected_handler, ConnectionContext(0));
+      detail::invoke_user_callback("udp_client", "on_disconnect", lost_handler, ConnectionContext(0));
+      // A loss callback may request stop; do not admit the following terminal
+      // error into the closed generation.
+      auto error_lease = callback_gate_.enter(generation);
+      if (error_lease.admitted() && terminal_handler)
+        detail::invoke_user_callback("udp_client", "on_error", terminal_handler,
+                                     channel_snapshot
+                                         ? detail::build_error_context(*channel_snapshot, "Connection error")
+                                         : ErrorContext(ErrorCode::IoError, "Connection error"));
     });
   }
 
   void attach_framer_callback() {
     if (!framer) return;
     framer->on_message([this](memory::ConstByteSpan msg) {
+      const auto generation = callback_generation_.load();
+      auto message_lease = callback_gate_.enter(generation);
+      if (!message_lease.admitted()) return;
+      auto prepared = detail::take_prepared_message(0, msg);
       // #441: snapshot under a shared_lock (pure read), build the copy
       // before taking the exclusive lock for queue mutation.
       bool batch_mode;
@@ -522,9 +703,9 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
       }
 
       if (batch_mode) {
-        MessageContext ctx(0, memory::SafeDataBuffer(msg));
+        auto ctx = prepared ? std::move(*prepared) : detail::retain_received(receive_state_->scope, 0, msg);
         interface::SharedCallback<BatchMessageHandler> flush_handler;
-        std::vector<MessageContext> batch;
+        detail::ReceiveBatch batch;
         {
           std::unique_lock<std::shared_mutex> lock(mutex_);
           message_batch_queue_.emplace_back(std::move(ctx));
@@ -533,7 +714,7 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
             batch = std::move(message_batch_queue_);
             message_batch_queue_.clear();
           } else if (message_batch_queue_.size() == 1) {
-            schedule_batch_timer();
+            schedule_batch_timer(generation);
           }
         }
         detail::invoke_user_callback("udp_client", "on_message_batch", flush_handler, batch);
@@ -546,7 +727,9 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
 
   void set_framer(std::unique_ptr<framer::IFramer> f) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto receive = std::make_shared<detail::ReceiveState>(receive_state_->scope);
     framer = std::shared_ptr<framer::IFramer>(std::move(f));
+    receive_state_ = std::move(receive);
     if (framer && (message_handler || message_batch_handler_)) attach_framer_callback();
   }
 
@@ -563,9 +746,13 @@ struct UdpClient::Impl : public std::enable_shared_from_this<Impl> {
   }
 };
 
-UdpClient::UdpClient(const config::UdpConfig& cfg) : impl_(std::make_shared<Impl>(cfg)) {}
+UdpClient::UdpClient(const config::UdpConfig& cfg) : impl_(std::make_shared<Impl>(cfg)) {
+  config::detail::validate(cfg);
+}
 UdpClient::UdpClient(const config::UdpConfig& cfg, std::shared_ptr<boost::asio::io_context> ioc)
-    : impl_(std::make_shared<Impl>(cfg, ioc)) {}
+    : impl_(std::make_shared<Impl>(cfg, ioc)) {
+  config::detail::validate(cfg);
+}
 UdpClient::UdpClient(std::shared_ptr<interface::Channel> ch) : impl_(std::make_shared<Impl>(ch)) {
   impl_->setup_internal_handlers();
 }
@@ -574,22 +761,42 @@ UdpClient::~UdpClient() = default;
 UdpClient::UdpClient(UdpClient&&) noexcept = default;
 UdpClient& UdpClient::operator=(UdpClient&&) noexcept = default;
 
+UdpClient& UdpClient::receive_limits(ReceiveLimits limits) {
+  limits.validate();
+  std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  if (impl_->started_ || impl_->stop_callers_.load() || (impl_->stop_requested_ && impl_->alive_marker) ||
+      detail::in_data_callback())
+    throw std::logic_error("receive limits require completed stop");
+  auto budget = std::make_shared<detail::ReceiveBudget>(limits);
+  auto scope = budget->open_scope();
+  auto receive = std::make_shared<detail::ReceiveState>(std::move(scope));
+  impl_->receive_state_->reset(impl_->framer.get());
+  impl_->receive_limits_ = limits;
+  impl_->receive_budget_ = std::move(budget);
+  impl_->receive_state_ = std::move(receive);
+  return *this;
+}
+ReceiveMemoryStats UdpClient::receive_stats() const {
+  std::shared_lock<std::shared_mutex> lock(impl_->mutex_);
+  return impl_->receive_budget_->stats();
+}
+
 std::future<bool> UdpClient::start() { return impl_->start(); }
 void UdpClient::stop() { impl_->stop(); }
-bool UdpClient::send(std::string_view data) { return impl_->send(data); }
-bool UdpClient::try_send(std::string_view data) { return impl_->try_send(data); }
-bool UdpClient::send_line(std::string_view line) { return impl_->send_line(line); }
-bool UdpClient::try_send_line(std::string_view line) { return impl_->try_send_line(line); }
-bool UdpClient::send_move(std::vector<uint8_t>&& data) { return impl_->send_move(std::move(data)); }
-bool UdpClient::try_send_move(std::vector<uint8_t>&& data) { return impl_->try_send_move(std::move(data)); }
-bool UdpClient::send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+SendResult UdpClient::send(std::string_view data) { return impl_->send(data); }
+SendResult UdpClient::try_send(std::string_view data) { return impl_->try_send(data); }
+SendResult UdpClient::send_line(std::string_view line) { return impl_->send_line(line); }
+SendResult UdpClient::try_send_line(std::string_view line) { return impl_->try_send_line(line); }
+SendResult UdpClient::send_move(std::vector<uint8_t>&& data) { return impl_->send_move(std::move(data)); }
+SendResult UdpClient::try_send_move(std::vector<uint8_t>&& data) { return impl_->try_send_move(std::move(data)); }
+SendResult UdpClient::send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
   return impl_->send_shared(std::move(data));
 }
-bool UdpClient::try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
+SendResult UdpClient::try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data) {
   return impl_->try_send_shared(std::move(data));
 }
-bool UdpClient::send_blocking(std::string_view data) { return impl_->send_blocking(data); }
-bool UdpClient::send_line_blocking(std::string_view line) { return impl_->send_line_blocking(line); }
+SendResult UdpClient::send_blocking(std::string_view data) { return impl_->send_blocking(data); }
+SendResult UdpClient::send_line_blocking(std::string_view line) { return impl_->send_line_blocking(line); }
 bool UdpClient::connected() const {
   std::shared_lock<std::shared_mutex> lock(impl_->mutex_);
   return impl_->channel && impl_->channel->is_connected();
@@ -649,12 +856,16 @@ UdpClient& UdpClient::auto_start(bool m) {
 }
 
 UdpClient& UdpClient::backpressure_threshold(size_t threshold) {
+  config::detail::range(threshold, base::constants::MIN_BACKPRESSURE_THRESHOLD,
+                        base::constants::MAX_BACKPRESSURE_THRESHOLD, "invalid backpressure_threshold");
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  impl_->require_stopped_config();
   impl_->cfg.backpressure_threshold = threshold;
   return *this;
 }
 
 UdpClient& UdpClient::backpressure_strategy(base::constants::BackpressureStrategy strategy) {
+  config::detail::strategy(strategy);
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
   impl_->cfg.backpressure_strategy = strategy;
   if (impl_->channel) {
@@ -676,29 +887,41 @@ base::constants::BackpressureStrategy UdpClient::backpressure_strategy() const {
 }
 
 UdpClient& UdpClient::send_buffer_size(size_t bytes) {
+  if (bytes != 0)
+    config::detail::range(bytes, base::constants::MIN_SOCKET_BUFFER_SIZE, base::constants::MAX_SOCKET_BUFFER_SIZE,
+                          "invalid send_buffer_size");
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  impl_->require_stopped_config();
   impl_->cfg.send_buffer_size = bytes;
   return *this;
 }
 
 UdpClient& UdpClient::receive_buffer_size(size_t bytes) {
+  if (bytes != 0)
+    config::detail::range(bytes, base::constants::MIN_SOCKET_BUFFER_SIZE, base::constants::MAX_SOCKET_BUFFER_SIZE,
+                          "invalid receive_buffer_size");
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  impl_->require_stopped_config();
   impl_->cfg.receive_buffer_size = bytes;
   return *this;
 }
 
 UdpClient& UdpClient::manage_external_context(bool m) {
+  std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  impl_->require_stopped_config();
   impl_->manage_external_context.store(m);
   return *this;
 }
 
 UdpClient& UdpClient::batch_size(size_t size) {
+  config::detail::require(size > 0, "batch size must be positive");
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
   impl_->max_batch_size_ = size;
   return *this;
 }
 
 UdpClient& UdpClient::batch_latency(std::chrono::milliseconds latency) {
+  config::detail::duration(latency, 0, std::numeric_limits<int>::max(), true, "invalid batch latency");
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
   impl_->max_batch_latency_ = latency;
   return *this;

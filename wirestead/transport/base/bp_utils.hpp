@@ -56,6 +56,18 @@ inline bool try_reserve_write_bytes(std::atomic<size_t>& queue_bytes, const std:
   }
 }
 
+// Nonblocking admission shares the plain-write reservation lock and includes
+// accepted posts that have not reached the executor yet.
+inline bool try_reserve_write_bytes(std::mutex& mutex, const std::atomic<size_t>& inflight_bytes,
+                                    std::atomic<size_t>& queue_bytes, const std::atomic<size_t>& pending_bytes,
+                                    const std::atomic<bool>& backpressure_active, size_t bytes, size_t bp_high,
+                                    size_t bp_limit) {
+  std::lock_guard<std::mutex> lock(mutex);
+  const size_t inflight = inflight_bytes.load(std::memory_order_relaxed);
+  if (inflight > bp_limit) return false;
+  return try_reserve_write_bytes(queue_bytes, pending_bytes, backpressure_active, bytes, bp_high, bp_limit - inflight);
+}
+
 inline void release_reserved_write_bytes(std::atomic<size_t>& queue_bytes, size_t bytes) {
   size_t current = queue_bytes.load(std::memory_order_relaxed);
   for (;;) {
@@ -128,15 +140,8 @@ inline void commit_reserved_limit_bytes(std::mutex& mtx, std::atomic<size_t>& co
   inflight_bytes.store(current > bytes ? current - bytes : 0, std::memory_order_relaxed);
 }
 
-// Locked increment for the rare plain-write path that skips
-// try_reserve_limit_bytes() entirely (tcp_client's BestEffort fallback,
-// which - unlike every other transport's plain path - has no precheck at
-// all, matching its pre-existing behavior). Still must go through the same
-// `mtx` as try_reserve_limit_bytes()/commit_reserved_limit_bytes() for this
-// transport instance: an increment landing outside the lock could let a
-// concurrent Reliable reservation's already-approved check get silently
-// invalidated by bytes it never accounted for, reopening the same race for
-// Reliable messages that this whole reservation scheme exists to close.
+// Legacy locked increment utility. Built-in plain writes now always reserve
+// capacity and use commit_reserved_limit_bytes() instead.
 inline void commit_unreserved_limit_bytes(std::mutex& mtx, std::atomic<size_t>& counter, size_t bytes) {
   std::lock_guard<std::mutex> lock(mtx);
   counter.fetch_add(bytes, std::memory_order_relaxed);
@@ -162,11 +167,8 @@ inline size_t variant_buffer_size(const T& buf) {
 // all ready at once. Draining several into one scatter-gather write collapses
 // those into one.
 //
-// Caps on how much of tx_ a single gather write may take. These matter for
-// BestEffort: buffers moved into the in-flight batch have left tx_ and can no
-// longer be dropped by maybe_flush_for_keep_latest(), so an unbounded batch
-// would let stale data survive a keep-latest trim that was supposed to discard
-// it. They also bound how much gets re-queued when a write fails.
+// Caps on how much of tx_ a single gather write may take. These bound the
+// active batch and the work re-queued when a write fails.
 // 16, not an arbitrary round number: asio fills at most 16 buffers per
 // prepared_buffers (detail/consuming_buffers.hpp, max_buffers), which is also
 // the iovec count a single sendmsg gets. Staying at or under it keeps each
@@ -186,6 +188,19 @@ inline ::boost::asio::const_buffer variant_const_buffer(const T& buf) {
     return ::boost::asio::const_buffer(buf.data(), buf.size());
   }
 }
+// Identity for plain buffers; tracked/endpoint queue items project their payload.
+struct IdentityProjection {
+  template <typename T>
+  constexpr T& operator()(T& x) const {
+    return x;
+  }
+};
+
+struct IgnoreDroppedBuffer {
+  template <typename T>
+  void operator()(const T&) const {}
+};
+
 // Moves buffers from the front of `tx` into `batch` (which is cleared first)
 // up to the caps above, filling `views` with the matching const_buffers.
 // Returns the total byte count, which is what the caller must subtract from
@@ -198,22 +213,24 @@ inline ::boost::asio::const_buffer variant_const_buffer(const T& buf) {
 // copies into the composed operation. An earlier version passed a non-owning
 // view to dodge that copy; asio's partial-write bookkeeping does not survive
 // an aliasing sequence, and it silently duplicated or stalled queued buffers.
+// Project extracts the payload while batch retains the complete queue item.
 // One small copy per gather write is the right trade - it replaces N syscalls,
 // and with several messages per write it is fewer allocations than before.
-template <typename Deque, typename Batch>
-inline size_t take_gather_batch(Deque& tx, Batch& batch, std::vector<::boost::asio::const_buffer>& views) {
+template <typename Deque, typename Batch, typename Project = IdentityProjection>
+inline size_t take_gather_batch(Deque& tx, Batch& batch, std::vector<::boost::asio::const_buffer>& views,
+                                Project project = Project{}) {
   batch.clear();
   views.clear();
   size_t total = 0;
   while (!tx.empty() && batch.size() < kMaxGatherBuffers && total < kMaxGatherBytes) {
-    const size_t n = std::visit([](const auto& b) { return variant_buffer_size(b); }, tx.front());
+    const size_t n = std::visit([](const auto& b) { return variant_buffer_size(b); }, project(tx.front()));
     batch.push_back(std::move(tx.front()));
     tx.pop_front();
     total += n;
   }
   views.reserve(batch.size());
   for (const auto& b : batch) {
-    views.push_back(std::visit([](const auto& x) { return variant_const_buffer(x); }, b));
+    views.push_back(std::visit([](const auto& x) { return variant_const_buffer(x); }, project(b)));
   }
   return total;
 }
@@ -228,18 +245,6 @@ inline void return_gather_batch(Deque& tx, Batch& batch) {
   batch.clear();
 }
 
-// Identity projection: the default for maybe_flush_for_keep_latest()'s `project`
-// parameter below, used as-is by transports whose tx_ deque holds the
-// BufferVariant directly. UDP's tx_ holds TxItem{BufferVariant, destination}
-// instead, and supplies a projection extracting `.buffer` so this same
-// trimming logic can still visit the variant inside.
-struct IdentityProjection {
-  template <typename T>
-  constexpr T& operator()(T& x) const {
-    return x;
-  }
-};
-
 // BestEffort queue-trimming shared by all stream transports (TCP client/server, UDS client/server)
 // and, via a projection, UDP.
 // Must be called on the strand immediately before enqueueing a new buffer of `added` bytes.
@@ -248,18 +253,20 @@ struct IdentityProjection {
 // For BestEffort:
 //   added >= bp_high  →  drop entire tx_ (full keep-latest replacement).
 //   otherwise         →  pop oldest tx_ entries until queue_bytes + added <= bp_high.
-template <typename Deque, typename Project = IdentityProjection>
+// on_drop observes each removed item before destruction and must not throw.
+template <typename Deque, typename Project = IdentityProjection, typename OnDrop = IgnoreDroppedBuffer>
 inline DropAccounting maybe_flush_for_keep_latest(::wirestead::base::constants::BackpressureStrategy bp_strategy,
                                                   size_t added, size_t bp_high, Deque& tx,
                                                   std::atomic<size_t>& queue_bytes,
                                                   const std::atomic<bool>& backpressure_active,
-                                                  Project project = Project{}) {
+                                                  Project project = Project{}, OnDrop on_drop = OnDrop{}) {
   DropAccounting dropped;
   if (bp_strategy != ::wirestead::base::constants::BackpressureStrategy::BestEffort) return dropped;
 
   if (added >= bp_high) {
     size_t removed_bytes = 0;
     for (auto& buf : tx) {
+      on_drop(buf);
       removed_bytes += std::visit([](const auto& b) { return variant_buffer_size(b); }, project(buf));
     }
     dropped.messages = tx.size();
@@ -277,6 +284,7 @@ inline DropAccounting maybe_flush_for_keep_latest(::wirestead::base::constants::
       if (qb + added <= bp_high) break;
       const size_t oldest = std::visit([](const auto& b) { return variant_buffer_size(b); }, project(tx.front()));
       queue_bytes.store(qb > oldest ? qb - oldest : 0, std::memory_order_relaxed);
+      on_drop(tx.front());
       tx.pop_front();
       ++dropped.messages;
       dropped.bytes += oldest;
