@@ -27,7 +27,9 @@
 #include "wirestead/diagnostics/logger.hpp"
 #include "wirestead/framer/iframer.hpp"
 #include "wirestead/wrapper/context.hpp"
+#include "wirestead/wrapper/fanout_result.hpp"
 #include "wirestead/wrapper/runtime_stats.hpp"
+#include "wirestead/wrapper/send_result.hpp"
 
 namespace wirestead {
 namespace wrapper {
@@ -62,12 +64,22 @@ class WIRESTEAD_API ServerInterface {
   [[nodiscard]] virtual bool start_sync() { return start().get(); }
 
   /**
-   * @brief Stop the server and block until all active sessions are closed.
+   * @brief Request server shutdown and wait when the calling thread permits it.
    *
-   * Safe to call from any thread. After stop() returns, no further callbacks will fire
-   * and it is safe to destroy the object. Calling stop() more than once is a no-op.
+   * Outside callers wait for shutdown completion, including concurrent callers
+   * that find a stop already in progress. No user callback remains running or can
+   * start from that run when a waiting stop returns. Repeated completed stops are no-ops.
    *
-   * Restart contract (#444): stop() fully tears down the underlying transport
+   * On an executor needed by shutdown (including this object's own callback),
+   * stop() only requests shutdown and returns without waiting. Such a return does
+   * not permit destruction, restart, or stopped-only configuration. An outside
+   * caller must observe shutdown completion first. Destroying the object from its
+   * own callback and concurrent destruction/use or start/stop are unsupported.
+   * Externally managed executors must keep making progress while callers wait;
+   * user callbacks must return. Internal handlers may remain if they own their
+   * lifetime and cannot affect a later run.
+   *
+   * Restart contract (#444): completed shutdown fully tears down the underlying transport
    * (acceptor, sessions, timers) rather than leaving it in a reusable
    * half-alive state. Every on_*() callback and every config setter ever
    * called on this wrapper remains in force across any number of stop()/
@@ -85,7 +97,10 @@ class WIRESTEAD_API ServerInterface {
    *
    * The cumulative fields (`bytes_*`, `messages_*`, `failed_sends`, `dropped_*`,
    * `backpressure_events`, `max_queued_bytes`) cover every session this server
-   * has accepted, including ones that have since disconnected. The
+   * has accepted, including ones that have since disconnected or stopped.
+   * Native TCP/UDS send_accounting also covers those contributors. During stop,
+   * retiring sessions remain in the aggregate until their final totals transfer.
+   * The
    * instantaneous fields (`queued_bytes`, `pending_bytes`,
    * `backpressure_active`) describe only the sessions that are live right now.
    *
@@ -102,9 +117,9 @@ class WIRESTEAD_API ServerInterface {
    * server-wide stats() and the session itself is gone. Sample this while the
    * client is connected if you need its numbers in isolation.
    *
-   * Not every server can answer. UDP servers group datagrams into virtual
-   * sessions that have no queues or counters of their own, so they always
-   * return nullopt; their traffic is only visible in the aggregate.
+   * Built-in UDP servers expose per-virtual-session traffic and accounting.
+   * Their backpressure state/events describe shared socket capacity. Custom
+   * servers may return nullopt when per-client statistics are unsupported.
    */
   virtual std::optional<RuntimeStats> client_stats(ClientId /*client_id*/) const { return std::nullopt; }
 
@@ -142,19 +157,19 @@ class WIRESTEAD_API ServerInterface {
    * BestEffort: non-blocking, drops if the client's send queue is full.
    * Reliable:   blocks until queue pressure is relieved, then enqueues.
    *
-   * @return true Data was accepted. @return false Dropped or client not found.
+   * @return Local queue acceptance or a synchronous rejection reason; not delivery.
    */
-  virtual bool send_to(ClientId client_id, std::string_view data) = 0;
+  [[nodiscard]] virtual SendResult send_to(ClientId client_id, std::string_view data) = 0;
 
   /**
    * @brief Send to all connected clients using non-blocking fan-out.
    *
    * Does not wait for slow clients to relieve backpressure. Use send_to_blocking()
-   * for strict per-client blocking delivery.
+   * for per-client blocking queue admission.
    *
-   * @return true At least one client accepted the data.
+   * @return Counts over the fixed target set; empty() identifies zero targets.
    */
-  virtual bool broadcast(std::string_view data) = 0;
+  [[nodiscard]] virtual FanoutResult broadcast(std::string_view data) = 0;
 
   /**
    * @brief Block until queue pressure is relieved, then send to a client. Ignores strategy.
@@ -163,9 +178,10 @@ class WIRESTEAD_API ServerInterface {
    * backpressure does not clear. stop() from another thread is expected to unblock
    * waiting senders.
    *
-   * @return true Data was accepted. @return false Server stopped while waiting.
+   * @return Local queue acceptance or a synchronous rejection reason. A stopped wait returns
+   * CancelledWhileWaiting; a lost target returns NotReady.
    */
-  virtual bool send_to_blocking(ClientId client_id, std::string_view data) = 0;
+  [[nodiscard]] virtual SendResult send_to_blocking(ClientId client_id, std::string_view data) = 0;
 
   /**
    * @brief Non-blocking send_to that always drops on a full queue, ignoring strategy.
@@ -177,38 +193,38 @@ class WIRESTEAD_API ServerInterface {
    * send_to_blocking() when Reliable enqueue semantics are required for large
    * payloads.
    *
-   * @return true Data was accepted. @return false Dropped or client not found.
+   * @return Local queue acceptance or a synchronous rejection reason; not delivery.
    */
-  virtual bool try_send_to(ClientId client_id, std::string_view data) = 0;
+  [[nodiscard]] virtual SendResult try_send_to(ClientId client_id, std::string_view data) = 0;
 
   /**
    * @brief Non-blocking broadcast that always drops on full queues, ignoring strategy.
    *
    * Uses the same non-blocking queue threshold policy as try_send_to().
    *
-   * @return true At least one client accepted the data.
+   * @return Counts over the fixed target set; empty() identifies zero targets.
    */
-  virtual bool try_broadcast(std::string_view data) = 0;
+  [[nodiscard]] virtual FanoutResult try_broadcast(std::string_view data) = 0;
 
   /**
-   * @brief Send a line (data + "\n") to all clients, honouring the backpressure strategy.
+   * @brief Send a line (data + "\n") to all clients without waiting for capacity.
    */
-  virtual bool broadcast_line(std::string_view line) = 0;
+  [[nodiscard]] virtual FanoutResult broadcast_line(std::string_view line) = 0;
 
   /**
    * @brief Send a line (data + "\n") to a specific client, honouring the backpressure strategy.
    */
-  virtual bool send_to_line(ClientId client_id, std::string_view line) = 0;
+  [[nodiscard]] virtual SendResult send_to_line(ClientId client_id, std::string_view line) = 0;
 
   /**
    * @brief Non-blocking broadcast_line that always drops on a full queue, ignoring strategy.
    */
-  virtual bool try_broadcast_line(std::string_view line) = 0;
+  [[nodiscard]] virtual FanoutResult try_broadcast_line(std::string_view line) = 0;
 
   /**
    * @brief Non-blocking send_to_line that always drops on a full queue, ignoring strategy.
    */
-  virtual bool try_send_to_line(ClientId client_id, std::string_view line) = 0;
+  [[nodiscard]] virtual SendResult try_send_to_line(ClientId client_id, std::string_view line) = 0;
 
   // Event handlers
 

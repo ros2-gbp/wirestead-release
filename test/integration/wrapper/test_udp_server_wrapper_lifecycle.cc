@@ -68,8 +68,8 @@ TEST(UdpServerWrapperLifecycleTest, SessionReaping) {
   wrapper::UdpServer server(cfg);
   server.idle_timeout(100ms);
 
-  std::atomic<int> disconnects{0};
-  server.on_disconnect([&](const wrapper::ConnectionContext&) { disconnects++; });
+  std::atomic<int> expiries{0};
+  server.on_session_expired([&](const wrapper::ConnectionContext&) { expiries++; });
 
   auto started = server.start();
   ASSERT_TRUE(started.get());
@@ -80,17 +80,14 @@ TEST(UdpServerWrapperLifecycleTest, SessionReaping) {
                boost::asio::ip::udp::endpoint(boost::asio::ip::make_address("127.0.0.1"), port));
 
   ASSERT_TRUE(TestUtils::waitForCondition([&]() { return server.client_count() == 1; }, 1000));
-  EXPECT_TRUE(TestUtils::waitForCondition([&]() { return disconnects.load() == 1; }, 2000));
+  EXPECT_TRUE(TestUtils::waitForCondition([&]() { return expiries.load() == 1; }, 2000));
   EXPECT_EQ(server.client_count(), 0u);
 
   server.stop();
 }
 
-// UDP groups datagrams into virtual sessions by source endpoint. Those have no
-// queues or counters of their own, so there is nothing per-client to report -
-// client_stats() says so rather than inventing a number, even while a virtual
-// session is live and visible through client_count().
-TEST(UdpServerWrapperLifecycleTest, ClientStatsUnsupportedForVirtualSessions) {
+// Virtual sessions expose their own traffic while the socket retains totals.
+TEST(UdpServerWrapperLifecycleTest, ClientStatsReportsVirtualSessionTraffic) {
   auto port = TestUtils::getAvailableTestPort();
   config::UdpConfig cfg;
   cfg.bind_address = "127.0.0.1";
@@ -109,10 +106,15 @@ TEST(UdpServerWrapperLifecycleTest, ClientStatsUnsupportedForVirtualSessions) {
 
   const auto ids = server.connected_clients();
   ASSERT_EQ(ids.size(), 1u);
-  EXPECT_FALSE(server.client_stats(ids[0]).has_value());
+  const auto peer = server.client_stats(ids[0]);
+  ASSERT_TRUE(peer.has_value());
+  EXPECT_EQ(peer->bytes_received, 5u);
+  EXPECT_EQ(peer->messages_received, 1u);
+  ASSERT_TRUE(peer->send_accounting.has_value());
+  EXPECT_EQ(peer->send_accounting->accepted.requests, 0u);
   EXPECT_FALSE(server.client_stats(999999).has_value());
 
-  // The traffic is still accounted for, just not per client.
+  // The shared aggregate includes the same traffic exactly once.
   EXPECT_GT(server.stats().bytes_received, 0u);
 
   server.stop();
@@ -346,7 +348,7 @@ TEST(UdpServerWrapperLifecycleTest, ConfigurationSettersBeforeStartRemainFluent)
   EXPECT_EQ(&server, &server.bind_address("127.0.0.1"));
   EXPECT_EQ(&server, &server.idle_timeout(25ms));
   EXPECT_EQ(&server, &server.max_clients(0));
-  EXPECT_EQ(&server, &server.backpressure_threshold(256));
+  EXPECT_EQ(&server, &server.backpressure_threshold(1024));
   EXPECT_EQ(&server, &server.backpressure_strategy(base::constants::BackpressureStrategy::BestEffort));
   EXPECT_EQ(&server, &server.batch_size(3));
   EXPECT_EQ(&server, &server.batch_latency(15ms));
