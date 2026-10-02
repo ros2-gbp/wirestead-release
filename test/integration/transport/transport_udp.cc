@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "test/utils/test_utils.hpp"
 #include "wirestead/config/udp_config.hpp"
 #include "wirestead/memory/safe_span.hpp"
@@ -343,6 +344,8 @@ TEST_F(TransportUdpTest, QueueLimitMovesToError) {
     if (s == base::LinkState::Error) error_seen = true;
   });
   channel->start();
+  ioc.poll();
+  ASSERT_TRUE(channel->is_connected());
 
   // Queue huge data multiple times to overflow backpressure buffer
   // Note: UdpChannel enforces a minimum limit of DEFAULT_BACKPRESSURE_THRESHOLD (1MB)
@@ -362,7 +365,7 @@ TEST_F(TransportUdpTest, QueueLimitMovesToError) {
 
   EXPECT_TRUE(error_seen.load());
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST_F(TransportUdpTest, StopCancelsInFlightHandlers) {
@@ -447,7 +450,7 @@ TEST_F(TransportUdpTest, ExplicitDestinationWriteWithoutRemote) {
       1000);
   EXPECT_TRUE(received);
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 // async_try_write_to() is the try_ half of the explicit-destination pair and
@@ -492,7 +495,7 @@ TEST_F(TransportUdpTest, ExplicitDestinationTryWriteWithoutRemote) {
       },
       1000));
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 // enable_broadcast sets SO_BROADCAST during open_socket(), a block no test
@@ -543,7 +546,7 @@ TEST_F(TransportUdpTest, BroadcastOptionOpensAWorkingSocket) {
       },
       1000));
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 // reset_stats() is on the Channel contract - "cleared by reset_stats(), and by
@@ -590,7 +593,7 @@ TEST_F(TransportUdpTest, ResetStatsClearsCumulativeCounters) {
   EXPECT_EQ(after.messages_accepted, 0u);
   EXPECT_EQ(after.bytes_accepted, 0u);
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST_F(TransportUdpTest, MemoryPoolExplicitDestinationWriteWithoutRemote) {
@@ -633,7 +636,7 @@ TEST_F(TransportUdpTest, MemoryPoolExplicitDestinationWriteWithoutRemote) {
       1000);
   EXPECT_TRUE(received);
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST_F(TransportUdpTest, BytesFromExceptionStopsWhenConfigured) {
@@ -658,7 +661,8 @@ TEST_F(TransportUdpTest, BytesFromExceptionStopsWhenConfigured) {
   udp::socket sender(ioc, udp::endpoint(udp::v4(), 0));
   sender.send_to(net::buffer("boom", 4), udp::endpoint(net::ip::make_address("127.0.0.1"), port));
 
-  EXPECT_TRUE(TestUtils::waitForCondition([&] { return error_seen.load(); }, 1000));
+  EXPECT_TRUE(TestUtils::waitForCondition([&] { return !channel->is_connected(); }, 1000));
+  EXPECT_FALSE(error_seen.load());
   channel->stop();
 }
 
@@ -668,5 +672,5 @@ TEST_F(TransportUdpTest, InvalidRemoteAddressThrows) {
   cfg.remote_address = "not a valid address";
   cfg.remote_port = 12345;
 
-  EXPECT_THROW((void)UdpChannel::create(cfg), std::runtime_error);
+  EXPECT_THROW((void)UdpChannel::create(cfg), std::invalid_argument);
 }
