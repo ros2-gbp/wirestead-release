@@ -25,6 +25,10 @@ When a public API changes, `scripts/check_docs_coverage.sh` lists what has no
 mention on either side. It exists because two releases shipped eight APIs that
 neither had.
 
+`scripts/check_docs_compile.sh` covers the other direction: it compiles every
+documented C++ sample, on both sides, against these headers. Prose keeps
+reading fine after an API is removed or renamed, so nothing else notices.
+
 ## Core entrypoints
 
 - [Quick Start](quickstart.md)
@@ -38,6 +42,14 @@ neither had.
 - [ROS 2 Support Analysis](ros2_support_analysis.md)
 - [Migrating from Unilink](migration-from-unilink.md)
 - [Release Checklist](release_checklist.md)
+
+## Design drafts
+
+Proposals under review. They describe intended behavior, not current behavior.
+
+- [v0.10 Communication API Contract](communication_contract_v0.10.md)
+- [v0.10 Contract Audit](communication_contract_v0.10_audit.md)
+- [v0.10 Contract Decisions](communication_contract_v0.10_decisions.md)
 
 ## Extended user documentation
 
