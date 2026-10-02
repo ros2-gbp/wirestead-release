@@ -24,15 +24,22 @@
 #include <vector>
 
 #include "test/utils/test_utils.hpp"
+#include "test_connection_channel.hpp"
 #include "wirestead/interface/channel.hpp"
 #include "wirestead/wirestead.hpp"
 
 namespace wirestead::test::wrapper_support {
 
-class FakeChannel : public interface::Channel {
+class FakeChannel : public wirestead::test::TestConnectionChannel {
  public:
-  void start() override { connected_ = true; }
-  void stop() override { connected_ = false; }
+  void start() override {
+    connected_ = true;
+    connection_opened();
+  }
+  void stop() override {
+    connected_ = false;
+    connection_lost();
+  }
   bool is_connected() const override { return connected_; }
 
   boost::asio::any_io_executor get_executor() override {
@@ -40,23 +47,25 @@ class FakeChannel : public interface::Channel {
     return ioc.get_executor();
   }
 
-  bool async_write_copy(memory::ConstByteSpan) override {
+  SendResult async_write_copy_result(memory::ConstByteSpan) override {
     ++write_count_;
-    return true;
+    return SendResult::accept();
   }
-  bool async_write_move(std::vector<uint8_t>&&) override {
+  SendResult async_write_move_result(std::vector<uint8_t>&&) override {
     ++write_count_;
-    return true;
+    return SendResult::accept();
   }
-  bool async_write_shared(std::shared_ptr<const std::vector<uint8_t>>) override {
+  SendResult async_write_shared_result(std::shared_ptr<const std::vector<uint8_t>>) override {
     ++write_count_;
-    return true;
+    return SendResult::accept();
   }
 
-  bool async_try_write_copy(memory::ConstByteSpan data) override { return async_write_copy(data); }
-  bool async_try_write_move(std::vector<uint8_t>&& data) override { return async_write_move(std::move(data)); }
-  bool async_try_write_shared(std::shared_ptr<const std::vector<uint8_t>> data) override {
-    return async_write_shared(std::move(data));
+  SendResult async_try_write_copy_result(memory::ConstByteSpan data) override { return async_write_copy_result(data); }
+  SendResult async_try_write_move_result(std::vector<uint8_t>&& data) override {
+    return async_write_move_result(std::move(data));
+  }
+  SendResult async_try_write_shared_result(std::shared_ptr<const std::vector<uint8_t>> data) override {
+    return async_write_shared_result(std::move(data));
   }
 
   bool is_backpressure_active() const override { return backpressure_active_; }
@@ -74,8 +83,10 @@ class FakeChannel : public interface::Channel {
   void emit_state(base::LinkState state) {
     if (state == base::LinkState::Connected) {
       connected_ = true;
+      connection_opened();
     } else if (state == base::LinkState::Closed || state == base::LinkState::Error || state == base::LinkState::Idle) {
       connected_ = false;
+      connection_lost();
     }
 
     if (on_state_) {
@@ -100,8 +111,9 @@ class TcpServerLoopbackHarness {
 
   ~TcpServerLoopbackHarness() { stop_all(); }
 
-  std::shared_ptr<wrapper::TcpServer> start_server() {
+  std::shared_ptr<wrapper::TcpServer> start_server(size_t threshold = base::constants::DEFAULT_BACKPRESSURE_THRESHOLD) {
     server_ = std::make_shared<wrapper::TcpServer>(port_);
+    server_->backpressure_threshold(threshold);
     auto started = server_->start();
     if (!started.get()) {
       throw std::runtime_error("Failed to start TCP test server");
@@ -157,8 +169,9 @@ class UdsServerLoopbackHarness {
     TestUtils::removeFileIfExists(socket_path_);
   }
 
-  std::shared_ptr<wrapper::UdsServer> start_server() {
+  std::shared_ptr<wrapper::UdsServer> start_server(size_t threshold = base::constants::DEFAULT_BACKPRESSURE_THRESHOLD) {
     server_ = std::make_shared<wrapper::UdsServer>(socket_path_);
+    server_->backpressure_threshold(threshold);
     auto started = server_->start();
     if (!started.get()) {
       throw std::runtime_error("Failed to start UDS test server");
@@ -208,12 +221,13 @@ class UdpServerLoopbackHarness {
 
   ~UdpServerLoopbackHarness() { stop_all(); }
 
-  std::shared_ptr<wrapper::UdpServer> start_server() {
+  std::shared_ptr<wrapper::UdpServer> start_server(size_t threshold = base::constants::DEFAULT_BACKPRESSURE_THRESHOLD) {
     config::UdpConfig server_cfg;
     server_cfg.bind_address = "127.0.0.1";
     server_cfg.local_port = port_;
 
     server_ = std::make_shared<wrapper::UdpServer>(server_cfg);
+    server_->backpressure_threshold(threshold);
     auto started = server_->start();
     if (!started.get()) {
       throw std::runtime_error("Failed to start UDP test server");

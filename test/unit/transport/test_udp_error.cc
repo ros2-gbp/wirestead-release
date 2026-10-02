@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "tcp_stop_with_context.hpp"
 #include "wirestead/base/common.hpp"
 #include "wirestead/config/udp_config.hpp"
 #include "wirestead/memory/safe_span.hpp"
@@ -52,6 +53,8 @@ TEST(TransportUdpErrorTest, SendOversizedPacket) {
   });
 
   channel->start();
+  ioc.poll();
+  ASSERT_TRUE(channel->is_connected());
 
   // UDP payload limit is 65535. Sending 100KB should definitely fail.
   std::vector<uint8_t> huge_packet(100000, 0xDD);
@@ -71,7 +74,7 @@ TEST(TransportUdpErrorTest, SendOversizedPacket) {
   ASSERT_TRUE(channel->last_error_info().has_value());
   EXPECT_EQ(channel->last_error_info()->component, "udp");
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithQueuedWrites) {
@@ -95,9 +98,11 @@ TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithQueuedWrites) {
   });
 
   channel->start();
+  ioc.poll();
+  ASSERT_TRUE(channel->is_connected());
 
   // Enqueue two oversized (guaranteed EMSGSIZE) writes back-to-back before the io_context
-  // ever runs, so the first is in flight and the second is still queued/pending when the
+  // processes the writes, so the first is in flight and the second is still queued/pending when the
   // first write's failure is delivered. This reproduces the scenario where more than one
   // large payload was queued at the moment a UDP write errors out.
   std::vector<uint8_t> huge_packet(100000, 0xDD);
@@ -117,7 +122,7 @@ TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithQueuedWrites) {
       << "Backpressure must clear once the channel errors out, otherwise a Reliable-mode "
          "sender blocked waiting on it deadlocks forever (see wirestead#427)";
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }
 
 TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithPendingOverflow) {
@@ -141,9 +146,11 @@ TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithPendingOverflow
   });
 
   channel->start();
+  ioc.poll();
+  ASSERT_TRUE(channel->is_connected());
 
-  // Enqueue many oversized (guaranteed EMSGSIZE) writes back-to-back before the io_context ever
-  // runs. The first activates backpressure and starts writing; in Reliable mode, all the rest
+  // Enqueue many oversized (guaranteed EMSGSIZE) writes back-to-back while the ready io_context is paused.
+  // The first activates backpressure and starts writing; in Reliable mode, all the rest
   // route into the pending_ overflow queue (not tx_) while backpressure stays active. When the
   // first write's failure is delivered, report_backpressure()'s internal cleanup path flushes
   // pending_ back into tx_ and can re-arm backpressure_active_ on its own if that flush alone
@@ -168,5 +175,5 @@ TEST(TransportUdpErrorTest, BackpressureClearsAfterWriteErrorWithPendingOverflow
       << "Backpressure must clear once the channel errors out even when many Reliable-mode "
          "writes had overflowed into the pending_ queue (see wirestead#427)";
 
-  channel->stop();
+  wirestead::test::stop_with_context(channel, ioc);
 }

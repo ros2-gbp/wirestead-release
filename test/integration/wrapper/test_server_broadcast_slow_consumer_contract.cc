@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <boost/asio.hpp>
 #include <chrono>
@@ -45,19 +46,19 @@ bool is_port_allocation_failure(const std::exception& ex) {
   return std::string_view(ex.what()).find("Unable to find available test port") != std::string_view::npos;
 }
 
-void expect_fast(std::string_view label, const std::function<bool()>& fn) {
+void expect_fast(std::string_view label, const std::function<wirestead::FanoutResult()>& fn) {
   SCOPED_TRACE(std::string(label));
   const auto start = std::chrono::steady_clock::now();
   EXPECT_TRUE(fn());
   EXPECT_LT(std::chrono::steady_clock::now() - start, 100ms);
 }
 
-bool call_fast(std::string_view label, const std::function<bool()>& fn) {
+bool call_fast(std::string_view label, const std::function<wirestead::FanoutResult()>& fn) {
   SCOPED_TRACE(std::string(label));
   const auto start = std::chrono::steady_clock::now();
-  const bool result = fn();
+  const auto result = fn();
   EXPECT_LT(std::chrono::steady_clock::now() - start, 100ms);
-  return result;
+  return static_cast<bool>(result);
 }
 
 template <typename Server>
@@ -206,6 +207,24 @@ TEST(ServerBroadcastSlowConsumerContractTest, TcpAggregateMaxQueuedBytesIsPeakNo
     server->broadcast(payload);
   }
   ASSERT_TRUE(peaks_recorded()) << "neither session ever queued anything";
+
+  // Finish every accepted write before comparing separately sampled peaks.
+  // Admission returns before its strand handler records the queue observation.
+  slow_a.non_blocking(true);
+  slow_b.non_blocking(true);
+  std::array<char, 8192> drain{};
+  ASSERT_TRUE(TestUtils::waitForCondition(
+      [&] {
+        for (auto* socket : {&slow_a, &slow_b}) {
+          boost::system::error_code ec;
+          socket->read_some(net::buffer(drain), ec);
+          if (ec && ec != net::error::would_block && ec != net::error::try_again) return false;
+        }
+        const auto a = server->client_stats(ids[0]);
+        const auto b = server->client_stats(ids[1]);
+        return a && b && a->bytes_sent == a->bytes_accepted && b->bytes_sent == b->bytes_accepted;
+      },
+      5000));
 
   const auto a = server->client_stats(ids[0]);
   const auto b = server->client_stats(ids[1]);
