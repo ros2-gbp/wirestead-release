@@ -55,7 +55,6 @@ set(WIRESTEAD_HEADERS
     wirestead/base/deprecated.hpp
     wirestead/base/platform.hpp
     wirestead/base/visibility.hpp
-    wirestead/compat/unilink.hpp
     wirestead/framer/iframer.hpp
     wirestead/framer/line_framer.hpp
     wirestead/framer/packet_framer.hpp
@@ -86,6 +85,8 @@ set(WIRESTEAD_HEADERS
     wirestead/diagnostics/runtime_stats_counter.hpp
     wirestead/factory/channel_factory.hpp
     wirestead/interface/channel.hpp
+    wirestead/interface/connection_channel.hpp
+    wirestead/interface/result_channel.hpp
     wirestead/interface/iserial_port.hpp
     wirestead/interface/itcp_acceptor.hpp
     wirestead/interface/itcp_resolver.hpp
@@ -95,7 +96,6 @@ set(WIRESTEAD_HEADERS
     wirestead/interface/iuds_socket.hpp
     wirestead/memory/memory_pool.hpp
     wirestead/memory/memory_tracker.hpp
-    wirestead/memory/memory_validator.hpp
     wirestead/memory/safe_data_buffer.hpp
     wirestead/memory/safe_span.hpp
     wirestead/transport/serial/boost_serial_port.hpp

@@ -28,6 +28,7 @@
 #include "wirestead/base/visibility.hpp"
 #include "wirestead/config/serial_config.hpp"
 #include "wirestead/wrapper/ichannel.hpp"
+#include "wirestead/wrapper/receive_limits.hpp"
 
 namespace boost {
 namespace asio {
@@ -53,6 +54,7 @@ class WIRESTEAD_API Serial : public ChannelInterface {
  public:
   Serial(const std::string& device, uint32_t baud_rate);
   Serial(const std::string& device, uint32_t baud_rate, std::shared_ptr<boost::asio::io_context> external_ioc);
+  /// Requires the matching native transport or ConnectionChannel; otherwise throws std::invalid_argument.
   explicit Serial(std::shared_ptr<interface::Channel> channel);
   ~Serial() override;
 
@@ -67,18 +69,21 @@ class WIRESTEAD_API Serial : public ChannelInterface {
   // ChannelInterface implementation
   [[nodiscard]] std::future<bool> start() override;
   void stop() override;
-  bool send(std::string_view data) override;
-  bool send_line(std::string_view line) override;
-  bool send_blocking(std::string_view data) override;
-  bool send_line_blocking(std::string_view line) override;
-  bool try_send(std::string_view data) override;
-  bool try_send_line(std::string_view line) override;
-  bool send_move(std::vector<uint8_t>&& data) override;
-  bool try_send_move(std::vector<uint8_t>&& data) override;
-  bool send_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
-  bool try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] SendResult send(std::string_view data) override;
+  [[nodiscard]] SendResult send_line(std::string_view line) override;
+  [[nodiscard]] SendResult send_blocking(std::string_view data) override;
+  [[nodiscard]] SendResult send_line_blocking(std::string_view line) override;
+  [[nodiscard]] SendResult try_send(std::string_view data) override;
+  [[nodiscard]] SendResult try_send_line(std::string_view line) override;
+  [[nodiscard]] SendResult send_move(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] SendResult try_send_move(std::vector<uint8_t>&& data) override;
+  [[nodiscard]] SendResult send_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
+  [[nodiscard]] SendResult try_send_shared(std::shared_ptr<const std::vector<uint8_t>> data) override;
   bool connected() const override;
   RuntimeStats stats() const override;
+  /// Configure library receive storage while stopped. Custom framer internals are excluded.
+  Serial& receive_limits(ReceiveLimits limits);
+  ReceiveMemoryStats receive_stats() const;
   void reset_stats() override;
 
   Serial& on_data(MessageHandler handler) override;
