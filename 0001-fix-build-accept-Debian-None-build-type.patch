@@ -1,4 +1,4 @@
-From 973d62d9bdaf708c8697a23e11b0680f07f70f1a Mon Sep 17 00:00:00 2001
+From b8eabf64423c868a1d1c1aed72bc2cb0a5c816b6 Mon Sep 17 00:00:00 2001
 From: Jinwoo Sung <jwsung91@gmail.com>
 Date: Sat, 26 Sep 2026 14:33:32 +0900
 Subject: [PATCH] fix(build): accept Debian None build type
