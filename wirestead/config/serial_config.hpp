@@ -75,11 +75,11 @@ struct SerialConfig {
     unsigned delay_rts_after_send_ms = 0;
   } rs485;
 
-  // Modem control lines, engaged only when set. std::nullopt means "leave the
-  // driver's default alone", which is a different request from "drive it low":
-  // an Arduino resets when DTR is asserted at open, so a driver that must not
-  // reboot the board sets dtr=false explicitly, while one that has no opinion
-  // leaves it unset.
+  // Modem control lines, applied once the port is open and only when set.
+  // std::nullopt means "leave the driver's default alone", which is a different
+  // request from "drive it low". Neither prevents a board that resets on DTR,
+  // such as an Arduino, from rebooting at open: Linux asserts DTR while opening
+  // the tty, before these apply (#710).
   std::optional<bool> dtr;
   std::optional<bool> rts;
 
@@ -116,12 +116,19 @@ struct SerialConfig {
   // overhead across many instances in one process.
   bool use_shared_context = false;
 
+  // Linux opt-in: assert DTR and clear HUPCL after open so later closes and
+  // reopens can retain DTR. Cannot prevent a reset at the first open or USB
+  // disconnect. The tty setting persists after stop; false leaves it untouched.
+  // Combining this with dtr=false is invalid. Unsupported drivers fail to connect.
+  bool keep_dtr_on_close = false;
+
   // Validation methods
   bool is_valid() const {
-    return read_chunk >= base::constants::MIN_READ_BUFFER_SIZE && read_chunk <= base::constants::MAX_READ_BUFFER_SIZE &&
-           util::InputValidator::is_valid_device_path(device) && baud_rate >= base::constants::MIN_BAUD_RATE &&
-           baud_rate <= base::constants::MAX_BAUD_RATE && char_size >= 5 && char_size <= 8 &&
-           (stop_bits == 1 || stop_bits == 2) && retry_interval_ms >= base::constants::MIN_RETRY_INTERVAL_MS &&
+    return (!keep_dtr_on_close || dtr != false) && read_chunk >= base::constants::MIN_READ_BUFFER_SIZE &&
+           read_chunk <= base::constants::MAX_READ_BUFFER_SIZE && util::InputValidator::is_valid_device_path(device) &&
+           baud_rate >= base::constants::MIN_BAUD_RATE && baud_rate <= base::constants::MAX_BAUD_RATE &&
+           char_size >= 5 && char_size <= 8 && (stop_bits == 1 || stop_bits == 2) &&
+           retry_interval_ms >= base::constants::MIN_RETRY_INTERVAL_MS &&
            retry_interval_ms <= base::constants::MAX_RETRY_INTERVAL_MS &&
            backpressure_threshold >= base::constants::MIN_BACKPRESSURE_THRESHOLD &&
            backpressure_threshold <= base::constants::MAX_BACKPRESSURE_THRESHOLD &&
