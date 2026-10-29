@@ -766,10 +766,26 @@ UdpServer::UdpServer(std::shared_ptr<interface::Channel> ch) : impl_(std::make_s
   impl_->setup_internal_handlers();
 }
 
-UdpServer::~UdpServer() = default;
+// Stop on the destroying thread first. A callback in flight holds the Impl
+// alive, and if its reference were the last one, ~Impl would run on the io
+// thread, where the shutdown cannot join that thread (#613).
+UdpServer::~UdpServer() {
+  if (!impl_) return;
+  try {
+    impl_->stop();
+  } catch (...) {
+  }
+}
 
 UdpServer::UdpServer(UdpServer&&) noexcept = default;
-UdpServer& UdpServer::operator=(UdpServer&&) noexcept = default;
+// The previous Impl is handed to a temporary, whose destructor stops it here.
+UdpServer& UdpServer::operator=(UdpServer&& other) noexcept {
+  if (this != &other) {
+    UdpServer previous(std::move(*this));
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
 
 UdpServer& UdpServer::receive_limits(ReceiveLimits limits) {
   limits.validate();
