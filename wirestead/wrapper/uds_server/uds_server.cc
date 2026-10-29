@@ -699,10 +699,26 @@ UdsServer::UdsServer(std::shared_ptr<interface::Channel> channel) : impl_(std::m
   impl_->setup_internal_handlers();
 }
 
-UdsServer::~UdsServer() = default;
+// Stop on the destroying thread first. A callback in flight holds the Impl
+// alive, and if its reference were the last one, ~Impl would run on the io
+// thread, where the shutdown cannot join that thread (#613).
+UdsServer::~UdsServer() {
+  if (!impl_) return;
+  try {
+    impl_->stop();
+  } catch (...) {
+  }
+}
 
 UdsServer::UdsServer(UdsServer&&) noexcept = default;
-UdsServer& UdsServer::operator=(UdsServer&&) noexcept = default;
+// The previous Impl is handed to a temporary, whose destructor stops it here.
+UdsServer& UdsServer::operator=(UdsServer&& other) noexcept {
+  if (this != &other) {
+    UdsServer previous(std::move(*this));
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
 
 UdsServer& UdsServer::receive_limits(ReceiveLimits limits) {
   limits.validate();
