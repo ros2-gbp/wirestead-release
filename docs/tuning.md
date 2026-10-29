@@ -128,10 +128,39 @@ UART, and running a shared bus in plain UART mode makes every write collide.
 That presents as garbage from the device rather than as a configuration
 problem, which is why it is worth a line in the log.
 
-`dtr()` and `rts()` drive the modem control lines at open. Not calling them
-leaves the driver's default alone, which is **not** the same as passing
-`false`: an Arduino reboots when DTR is asserted at open, so a driver that must
-not reset the board calls `dtr(false)` explicitly.
+`dtr()` and `rts()` drive the modem control lines once the port is open. Not
+calling them leaves the driver's default alone, which is **not** the same as
+passing `false`.
+
+Neither can stop a board that resets on DTR, such as an Arduino, from
+rebooting when the port opens. On Linux, opening a tty asserts DTR before any
+setting is applied, and the board resets on that edge, so `dtr(false)` arrives
+too late. With the existing driver close policy, reopens from
+`reopen_on_error` and `rx_idle_timeout` can reset the board again (#710).
+
+On Linux, opt into retaining DTR across close and reopen:
+
+```cpp
+auto port = wirestead::serial("/dev/ttyACM0", 115200)
+                .keep_dtr_on_close()
+                .rx_idle_timeout(std::chrono::milliseconds(2500))
+                .build();
+```
+
+`keep_dtr_on_close` defaults to `false`, leaving DTR/HUPCL handling unchanged.
+When enabled, it asserts DTR and clears the tty's `HUPCL` flag after opening.
+It rejects `dtr(false)` and reports a terminal connection error if the driver
+cannot apply retention, including on unsupported platforms. It does not
+prevent the first open from resetting the board, and cannot preserve DTR
+through unplugging or power loss. Actual electrical behavior depends on the
+board and driver; validate it on the target hardware.
+
+The cleared HUPCL flag intentionally persists after `stop()` and destruction.
+A later process inherits that tty state. Disabling the option leaves the tty
+untouched; it does not restore HUPCL. Restore the close policy explicitly with
+`stty -F /dev/ttyACM0 hupcl` when the next user needs hangup-on-close. This may
+reset the attached board. The default remains unchanged because modem and
+other serial users can rely on hangup at close.
 
 Linux only (`TIOCSRS485`); DTR/RTS also work on macOS. Elsewhere both are
 no-ops.
@@ -152,7 +181,10 @@ auto port = wirestead::serial("/dev/ttyUSB0", 115200)
 
 Set it above the device's slowest expected interval, with margin — expiry tears
 the link down, so a value below the real gap between messages produces a reopen
-loop rather than a recovery.
+loop rather than a recovery. For a board that reboots when the port opens (see
+DTR above), the reboot is part of that gap: the timeout must also exceed the
+time from reset to its first message — about 1.7 s for an Arduino UNO's stock
+bootloader — or each reopen causes the next expiry.
 
 Receives only, deliberately unlike the TCP idle timeout, which any traffic in
 either direction resets: a driver polling a mute device writes on schedule and
