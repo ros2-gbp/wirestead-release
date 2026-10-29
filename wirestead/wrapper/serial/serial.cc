@@ -145,6 +145,7 @@ struct Serial::Impl : public std::enable_shared_from_this<Impl> {
   bool low_latency = true;
   config::SerialConfig::Rs485 rs485{};
   std::optional<bool> dtr;
+  bool keep_dtr_on_close = false;
   std::optional<bool> rts;
   std::chrono::milliseconds rx_idle_timeout{0};
   std::chrono::milliseconds retry_interval{base::constants::DEFAULT_RETRY_INTERVAL_MS};
@@ -820,6 +821,7 @@ struct Serial::Impl : public std::enable_shared_from_this<Impl> {
     config.low_latency = low_latency;
     config.rs485 = rs485;
     config.dtr = dtr;
+    config.keep_dtr_on_close = keep_dtr_on_close;
     config.rts = rts;
     config.rx_idle_timeout_ms = static_cast<unsigned>(rx_idle_timeout.count());
     config.backpressure_threshold = backpressure_threshold;
@@ -841,10 +843,26 @@ Serial::Serial(const std::string& d, uint32_t b, std::shared_ptr<boost::asio::io
 Serial::Serial(std::shared_ptr<interface::Channel> ch) : impl_(std::make_shared<Impl>(ch)) {
   impl_->setup_internal_handlers();
 }
-Serial::~Serial() = default;
+// Stop on the destroying thread first. A callback in flight holds the Impl
+// alive, and if its reference were the last one, ~Impl would run on the io
+// thread, where the shutdown cannot join that thread (#613).
+Serial::~Serial() {
+  if (!impl_) return;
+  try {
+    impl_->stop();
+  } catch (...) {
+  }
+}
 
 Serial::Serial(Serial&&) noexcept = default;
-Serial& Serial::operator=(Serial&&) noexcept = default;
+// The previous Impl is handed to a temporary, whose destructor stops it here.
+Serial& Serial::operator=(Serial&& other) noexcept {
+  if (this != &other) {
+    Serial previous(std::move(*this));
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
 
 Serial& Serial::receive_limits(ReceiveLimits limits) {
   limits.validate();
@@ -1012,7 +1030,16 @@ Serial& Serial::rs485(bool rts_on_send, bool rx_during_tx, unsigned delay_before
 Serial& Serial::dtr(bool assert_line) {
   std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
   impl_->require_stopped_config();
+  config::detail::require(assert_line || !impl_->keep_dtr_on_close, "keep_dtr_on_close conflicts with dtr(false)");
   impl_->dtr = assert_line;
+  return *this;
+}
+
+Serial& Serial::keep_dtr_on_close(bool enable) {
+  std::unique_lock<std::shared_mutex> lock(impl_->mutex_);
+  impl_->require_stopped_config();
+  config::detail::require(!enable || impl_->dtr != false, "keep_dtr_on_close conflicts with dtr(false)");
+  impl_->keep_dtr_on_close = enable;
   return *this;
 }
 
