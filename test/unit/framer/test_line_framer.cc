@@ -176,6 +176,25 @@ TEST_F(LineFramerTest, SplitDelimiter) {
   EXPECT_EQ(messages_[1], "World");
 }
 
+TEST_F(LineFramerTest, ResetFromCallbackWhileScanningBufferedData) {
+  framer_->on_message([this](memory::ConstByteSpan msg) {
+    messages_.emplace_back(reinterpret_cast<const char*>(msg.data()), msg.size());
+    framer_->reset();
+  });
+
+  std::string part1 = "ab";  // buffered, so the next push scans buffer_ itself
+  std::string part2 = "c\nd\n";
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part1.data()), part1.size()));
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part2.data()), part2.size()));
+  ASSERT_EQ(messages_.size(), 1);
+  EXPECT_EQ(messages_[0], "abc");
+
+  std::string next = "ok\n";
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(next.data()), next.size()));
+  ASSERT_EQ(messages_.size(), 2);
+  EXPECT_EQ(messages_[1], "ok");
+}
+
 TEST_F(LineFramerTest, OverflowTailIsNotDeliveredAsAMessage) {
   // Max length 5. A 9-byte message split across two calls overflows on the
   // first call (6 bytes, no delimiter yet); its last 3 bytes plus a
@@ -203,6 +222,40 @@ TEST_F(LineFramerTest, OverflowTailIsNotDeliveredAsAMessage) {
   // A genuinely new message after resynchronization is delivered normally.
   std::string next = "ok\n";
   framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(next.data()), next.size()));
+  ASSERT_EQ(messages_.size(), 1);
+  EXPECT_EQ(messages_[0], "ok");
+}
+
+TEST_F(LineFramerTest, MaxLengthMessageWithSplitMultiByteDelimiterIsDelivered) {
+  // A max_length body whose "\r\n" is split across pushes leaves max_length + 1
+  // bytes buffered. That tail is still a valid message, not an overflow.
+  framer_ = std::make_unique<LineFramer>("\r\n", false, 10);
+  framer_->on_message([this](memory::ConstByteSpan msg) {
+    messages_.emplace_back(reinterpret_cast<const char*>(msg.data()), msg.size());
+  });
+
+  std::string part1 = "0123456789\r";
+  std::string part2 = "\nok\r\n";
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part1.data()), part1.size()));
+  ASSERT_EQ(messages_.size(), 0);
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part2.data()), part2.size()));
+  ASSERT_EQ(messages_.size(), 2);
+  EXPECT_EQ(messages_[0], "0123456789");
+  EXPECT_EQ(messages_[1], "ok");
+}
+
+TEST_F(LineFramerTest, OverMaxLengthWithSplitMultiByteDelimiterIsStillRejected) {
+  framer_ = std::make_unique<LineFramer>("\r\n", false, 10);
+  framer_->on_message([this](memory::ConstByteSpan msg) {
+    messages_.emplace_back(reinterpret_cast<const char*>(msg.data()), msg.size());
+  });
+
+  // 11 bytes fit the split-delimiter allowance while buffered, but the body
+  // still exceeds max_length once its delimiter arrives.
+  std::string part1 = "0123456789A";
+  std::string part2 = "\r\nok\r\n";
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part1.data()), part1.size()));
+  framer_->push_bytes(memory::ConstByteSpan(reinterpret_cast<const uint8_t*>(part2.data()), part2.size()));
   ASSERT_EQ(messages_.size(), 1);
   EXPECT_EQ(messages_[0], "ok");
 }
