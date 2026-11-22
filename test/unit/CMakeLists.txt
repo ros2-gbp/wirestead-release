@@ -187,6 +187,15 @@ foreach(
   )
 endforeach()
 
+# Replaces global operator new, which TSan's runtime also defines.
+if(NOT WIRESTEAD_ENABLE_TSAN)
+  wirestead_add_unit_gtest(
+    run_unit_test_bounded_receive_growth
+    ${CMAKE_CURRENT_SOURCE_DIR}/wrapper/test_bounded_receive_growth.cc
+    "unit_wrapper" 120
+  )
+endif()
+
 # Callback gate (D-1)
 wirestead_add_unit_gtest(
   run_unit_wrapper_callback_gate
@@ -269,6 +278,12 @@ wirestead_add_unit_gtest(
   run_unit_test_tcp_abort
   ${CMAKE_CURRENT_SOURCE_DIR}/transport/test_tcp_abort.cc
   "unit_transport_tcp_error" 30
+)
+
+wirestead_add_unit_gtest(
+  run_unit_test_tcp_session_idle_timeout
+  ${CMAKE_CURRENT_SOURCE_DIR}/transport/test_tcp_session_idle_timeout.cc
+  "unit_transport_tcp_fast" 30
 )
 
 wirestead_add_unit_gtest(
